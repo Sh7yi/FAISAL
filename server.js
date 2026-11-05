@@ -348,7 +348,7 @@ const BIG_MOVE = /\b(surg\w*|soar\w*|spik\w*|plung\w*|tumbl\w*|crash\w*|slump\w*
 const HAS_REASON = /\b(as|after|on|following|amid)\b/i;
 
 const US = /\b(US|U\.S\.?|USA|America|American|Fed|Federal Reserve|FOMC|Powell|Warsh|Treasury|Treasuries|White House|Trump|Wall Street|Washington|Congress)\b/;
-const FOREIGN = /\b(UK|Britain|British|BoE|euro ?zone|ECB|German\w*|France|French|Ital\w+|Spain|Spanish|Japan\w*|BoJ|China|Chinese|PBOC|India\w*|Australia\w*|RBA|NZ|New Zealand|RBNZ|Canad\w+|BoC|Swiss|SNB|Korea\w*|Brazil\w*|Mexic\w+|Turk\w+|Russia\w*|Norway|Norges|Sweden|Riksbank)\b/i;
+const FOREIGN = /\b(UK|Britain|British|BoE|euro ?zone|ECB|German\w*|France|French|Ital\w+|Spain|Spanish|Japan\w*|BoJ|China|Chinese|PBOC|India\w*|Australia\w*|RBA|NZ|New Zealand|RBNZ|Canad\w+|BoC|Swiss|SNB|Korea\w*|Brazil\w*|Mexic\w+|Turk\w+|Russia\w*|Norway|Norges|Sweden|Riksbank|Indonesia\w*|Malaysia\w*|Thai\w*|Philippine\w*|Vietnam\w*|Singapore\w*|Taiwan\w*|Hong Kong|Saudi\w*|UAE|Qatar\w*|Kuwait\w*|South Africa\w*|Argentin\w*|Poland|Polish|Israel\w*|Nigeria\w*|Pakistan\w*|Egypt\w*|Asia\w*|Europe\w*)\b/i;
 
 // Things that are never price-moving news: questions, opinion, market wrap-ups, company results.
 const NOISE = [
@@ -357,6 +357,8 @@ const NOISE = [
   /\b((daily|weekly|market|price|technical|short-term|near-term) outlook|outlook:|analysis|price prediction|technical|elliott|commentary|preview|recap|wrap|wrap-up|kickstart|roundup|round-up|week ahead|what to (watch|expect)|how (to|will|does|do)|explainer|opinion|column|podcast|winners and losers|live blog|live updates|eco data|here's why|why)\b/i,
   /\b(could|might|may|would|should)\b/,
   /\b(earnings|profit|revenue|shares|IPO|merger|dividend|EPS|guidance|backlog|net loss)\b/i,
+  /\b(UBS|Goldman|JPMorgan|JP Morgan|Morgan Stanley|Citi|Citi's|Citigroup|BofA|Bank of America|Barclays|HSBC|Deutsche Bank|Wells Fargo|Nomura|analysts?|strategists?)\b/i,
+  /\b(BoJ|ECB|BoE|RBA|RBNZ|SNB|BoC|Bank of Japan|Bank of England|European Central Bank) (minutes|speech|official|member|chief|governor)|\bminutes:/i,
 ];
 
 const isNoise = (title) => NOISE.some((pattern) => pattern.test(title));
@@ -364,9 +366,18 @@ const isNoise = (title) => NOISE.some((pattern) => pattern.test(title));
 const scale = (unit) => ({ k: 1e3, m: 1e6, b: 1e9 }[String(unit).toLowerCase()] ?? 1);
 const number = (text, unit) => parseFloat(text.replace(/[,$+]/g, '').replace('−', '-')) * scale(unit);
 
+const EXPECTED = '[^,.;]{0,20}\\b(than )?(expected|forecasts?|estimates?|expectations|consensus)\\b';
+const SMALLER_THAN = new RegExp(`\\b(less|smaller)\\b${EXPECTED}`, 'i');
+const BIGGER_THAN = new RegExp(`\\b(more|bigger|larger)\\b${EXPECTED}`, 'i');
+const FELL = /\b(fall|falls|fell|falling|drop|drops|dropped|decline|declines|declined|draw|draws|shrink\w*|slide|slides|slid|sink|sinks|sank|ease|eases|eased|slow|slows|slowed)\b/i;
+
 function surprise(title) {
-  if (/\b(less|slower|softer|cooler|lower|weaker|smaller|below)\b[^,.;]{0,20}\b(than )?(expected|forecasts?|estimates?|expectations|consensus)\b/i.test(title)) return 'down';
-  if (/\b(more|faster|hotter|higher|stronger|bigger|larger|above)\b[^,.;]{0,20}\b(than )?(expected|forecasts?|estimates?|expectations|consensus)\b/i.test(title)) return 'up';
+  // "More" and "less" depend on the verb: falling less than expected is better than expected.
+  const fell = FELL.test(title);
+  if (SMALLER_THAN.test(title)) return fell ? 'up' : 'down';
+  if (BIGGER_THAN.test(title)) return fell ? 'down' : 'up';
+  if (new RegExp(`\\b(slower|softer|cooler|lower|weaker|below)\\b${EXPECTED}`, 'i').test(title)) return 'down';
+  if (new RegExp(`\\b(faster|hotter|higher|stronger|above|better)\\b${EXPECTED}`, 'i').test(title)) return 'up';
   const versus = title.match(/([+\-−]?\$?[\d.,]*\d)\s*([kKmMbB]?)%?\s*(?:vs\.?|versus|against)\s*(?:about\s+)?([+\-−]?\$?[\d.,]*\d)\s*([kKmMbB]?)%?\s*(?:expected|forecast|est\b|estimate|exp\b|consensus)/i);
   if (versus) {
     const actual = number(versus[1], versus[2]);
@@ -460,7 +471,7 @@ const WHY = {
 };
 
 const GULF = /\b(Iran\w*|Tehran|Hormuz|IRGC|Khamenei|Gulf)\b/i;
-const HEDGED = /\b(no (immediate )?plan|hints?|warns?|threat\w*|will|considers?|weighs?|mulls?|plans?|ready|vows?|if|blames?|allies|talks?|diplomacy|negotiat\w*|standoff|conflicting|crossings|traffic)\b/i;
+const HEDGED = /\b(no (immediate )?plan|plays? down|downplays?|prospect|rules? out|ruled out|den(y|ies|ied)|avoid\w*|end|ending|hopes?|hints?|warns?|threat\w*|will|considers?|weighs?|mulls?|plans?|ready|vows?|if|blames?|allies|talks?|diplomacy|negotiat\w*|standoff|conflicting|crossings|traffic)\b/i;
 
 function gulfRule(title) {
   if (!GULF.test(title)) return null;
@@ -520,7 +531,8 @@ function jobsRule(title) {
 
 function usDataRule(title) {
   const subject = /\b(ISM|retail sales|GDP)\b/i;
-  if (!subject.test(title) || (FOREIGN.test(title) && !US.test(title))) return null;
+  if (!subject.test(title) || FOREIGN.test(title)) return null;
+  if (!/\bISM\b/i.test(title) && !US.test(title)) return null;
   const dir = surprise(title) ?? moved(title, subject);
   if (!dir) return null;
   return { theme: 'us-data', gold: dir === 'up' ? bear('medium', WHY.strongData) : bull('medium', WHY.weakData) };
@@ -672,7 +684,7 @@ function worldRules(title) {
     if (/\b(deal|truce|pauses?|delays?|lifts?|removes?|cuts?)\b/i.test(title)) return { theme: 'trade', gold: bear('medium', WHY.tradeDealGold), oil: bull('medium', WHY.tradeDealOil) };
     if (/\b(impos\w*|announc\w*|slaps?|raises?|hikes?|doubles?|new)\b/i.test(title)) return { theme: 'trade', gold: bull('medium', WHY.tariffGold), oil: bear('medium', WHY.tariffOil) };
   }
-  if (/\b(government shutdown|debt ceiling|debt limit|US credit rating|U\.S\. credit rating|downgrades? (the )?(US|U\.S\.))\b/i.test(title)) {
+  if (/\b(government shutdown|debt ceiling|debt limit|US credit rating|U\.S\. credit rating|downgrades? (the )?(US|U\.S\.))\b/i.test(title) && !/\b(flags?|risks?|2\d{3})\b/i.test(title)) {
     return { theme: 'fiscal', gold: bull('medium', WHY.fiscal) };
   }
   if (/\b(US recession|U\.S\. recession|recession fears)\b/i.test(title)) {
@@ -1021,6 +1033,11 @@ function addDays(dateStr, n) {
 
 const dowOf = (dateStr) => new Date(`${dateStr}T12:00:00Z`).getUTCDay();
 const isMarketDay = (dateStr) => { const d = dowOf(dateStr); return d >= 1 && d <= 5; };
+const previousMarketDay = (dateStr) => {
+  let day = addDays(dateStr, -1);
+  while (!isMarketDay(day)) day = addDays(day, -1);
+  return day;
+};
 const mondayOf = (dateStr) => addDays(dateStr, -((dowOf(dateStr) + 6) % 7));
 const isValidDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(`${s}T12:00:00Z`));
 
@@ -1081,12 +1098,12 @@ function clock(date, tz) {
 function dateInZone(date, tz) {
   return ymd(zoned(date, tz));
 }
-  return { zoned, ymd, addDays, dowOf, isMarketDay, mondayOf, isValidDate, tradingDate, zonedToUtc, tradingWindow, marketStatus, longDate, shortDate, weekdayName, clock, dateInZone };
+  return { zoned, ymd, addDays, dowOf, isMarketDay, previousMarketDay, mondayOf, isValidDate, tradingDate, zonedToUtc, tradingWindow, marketStatus, longDate, shortDate, weekdayName, clock, dateInZone };
 })();
 
 // ---------- src-core-state.js ----------
 __modules['src-core-state.js'] = (() => {
-const { addDays, isMarketDay, mondayOf } = __modules['src-lib-time.js'];
+const { addDays, isMarketDay, mondayOf, previousMarketDay } = __modules['src-lib-time.js'];
 
 // Pegged currencies are the fallback if the exchange-rate feed is ever down.
 const PEGGED_FX = { USD: 1, AED: 3.6725, SAR: 3.75, QAR: 3.64, OMR: 0.3845, BHD: 0.376 };
@@ -1111,7 +1128,7 @@ function newDay(date) {
 
 function newState() {
   return {
-    version: 2,
+    version: 3,
     lastTickAt: null,
     firstTickDone: false,
     historySeeded: false,
@@ -1120,6 +1137,7 @@ function newState() {
     goldChange24h: null,
     metals: {},
     closes: { XAU: {}, BRENT: {} },
+    brentSpot: {},
     today: null,
     previous: { date: null, posts: [] },
     days: [],
@@ -1181,6 +1199,11 @@ function migrateState(saved) {
     oil: { ...base.oil, ...saved.oil },
     closes: { ...base.closes, ...saved.closes },
   };
+  // Version 2 mixed official spot prices in with futures prices, which gave wrong changes. Start them apart.
+  if ((saved.version ?? 1) < 3) {
+    state.brentSpot = { ...saved.closes?.BRENT };
+    state.closes.BRENT = {};
+  }
   if (state.today) state.today = normaliseDay(state.today);
   state.previous = { date: saved.previous?.date ?? null, posts: (saved.previous?.posts ?? []).map(normalisePost).filter(Boolean) };
   state.recent = (saved.recent ?? []).map((row) => {
@@ -1216,7 +1239,9 @@ function changes(state, market = 'gold', price = priceOf(state, market), date = 
   if (!date) return { day: null, week: null, month: null, year: null };
   let day;
   if (isMarketDay(date)) {
-    day = change(price, recentEnough(lastCloseBefore(closes, date), date, 5));
+    // Only the previous session's close counts as "today". Anything older would overstate the move.
+    const last = lastCloseBefore(closes, date);
+    day = change(price, last && last.date >= previousMarketDay(date) ? last : null);
     // The oil feed also reports a 24-hour change, which fills in until a close is saved.
     const reported = market === 'oil' ? state.oil?.change24h : state.goldChange24h;
     if (!day && Number.isFinite(reported) && price) {
@@ -1417,7 +1442,11 @@ class Collector {
   async load() {
     try {
       const text = await this.store.read('state.json');
-      if (text) this.state = migrateState(JSON.parse(text));
+      if (text) {
+        const saved = JSON.parse(text);
+        this.state = migrateState(saved);
+        if ((saved.version ?? 1) < 3 && !this.config.ai.key) this.#rereadStories();
+      }
       this.loaded = true;
       this.storeError = null;
     } catch (error) {
@@ -1427,6 +1456,28 @@ class Collector {
       this.log('store read failed', error.message);
     }
     if (!this.state.today) this.state.today = newDay(tradingDate(this.now()));
+  }
+
+  // After an upgrade, stories already on the page are read again with the improved rules.
+  #rereadStories() {
+    const { state } = this;
+    for (const list of [state.today?.posts, state.previous?.posts]) {
+      if (!list) continue;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const post = list[i];
+        if (post.type !== 'news') continue;
+        const label = classify(post.title);
+        if (!label) { list.splice(i, 1); continue; }
+        const readings = {};
+        for (const market of MARKET_KEYS) {
+          if (label[market]) readings[market] = { ...label[market], price: post.readings?.[market]?.price ?? null };
+        }
+        post.readings = readings;
+        post.theme = label.theme;
+      }
+    }
+    state.recent = state.recent.filter((row) => classify(row.title));
+    this.dirty = true;
   }
 
   async tick() {
@@ -1674,13 +1725,14 @@ class Collector {
       }
     }
     this.#mark('Yields and dollar (FRED)', failed < FRED_SERIES.length, failed ? `${failed} of ${FRED_SERIES.length} failed` : '');
-    // Official past Brent prices fill in the week, month and year changes. They arrive about a week late.
+    // Official past Brent prices are for the history page only. They are spot prices, which can sit
+    // far from the futures price shown live, so they are never used to work out a change.
     try {
       const rows = await this.#fredRows('DCOILBRENTEU');
       let added = 0;
       for (const [date, value] of rows.slice(-400)) {
-        if (date < state.today.date && isMarketDay(date) && !state.closes.BRENT[date]) {
-          state.closes.BRENT[date] = Number(value);
+        if (isMarketDay(date) && !state.brentSpot[date]) {
+          state.brentSpot[date] = Number(value);
           added++;
         }
       }
@@ -2471,7 +2523,7 @@ ${canonical ? raw(`<meta property="og:url" content="${esc(canonical)}"><meta pro
       ${FOOT.map(([href, label]) => html`<a href="${href}">${label}</a>`)}
       ${config.telegramUrl ? html`<a href="${config.telegramUrl}" rel="noopener">Telegram</a>` : ''}
     </nav>
-    <p class="foot-credit">Gold prices from <a href="https://gold-api.com" rel="noopener">gold-api.com</a>. Brent prices from <a href="https://www.oilpriceapi.com" rel="noopener">OilPriceAPI</a>. Past Brent prices: US Energy Information Administration, through FRED. <a href="https://www.exchangerate-api.com" rel="noopener">Rates by Exchange Rate API</a>. Headlines belong to their publishers and link back to them.
+    <p class="foot-credit">Gold prices from <a href="https://gold-api.com" rel="noopener">gold-api.com</a>. Brent prices from <a href="https://www.oilpriceapi.com" rel="noopener">OilPriceAPI</a>. Brent spot history: US Energy Information Administration, through FRED. <a href="https://www.exchangerate-api.com" rel="noopener">Rates by Exchange Rate API</a>. Headlines belong to their publishers and link back to them.
     ${config.contactEmail ? html` Contact: <a href="mailto:${config.contactEmail}">${config.contactEmail}</a>.` : ''}</p>
     <p class="foot-credit">© ${new Date().getUTCFullYear()} ${config.name}</p>
   </div>
@@ -3085,26 +3137,30 @@ function marketsPage({ state, config }) {
 
 function historyPage({ state, config, market = 'gold' }) {
   const info = MARKETS[market];
-  const closes = state.closes[info.symbol] ?? {};
+  const own = state.closes[info.symbol] ?? {};
+  const closes = market === 'oil' ? (state.brentSpot ?? {}) : own;
   const rows = Object.entries(closes).sort((a, b) => b[0].localeCompare(a[0]));
   const chart = historyChart(closes, market);
-  const digits = 2;
+  const recent = market === 'oil' ? Object.entries(own).sort((a, b) => b[0].localeCompare(a[0])).slice(0, 30) : [];
   const body = html`
   <section class="page-head"><div class="wrap">
     <h1>${info.name} price history</h1>
-    <p class="lede">${market === 'oil' ? 'Daily Brent prices. Recent days are saved at 5pm New York time. Older days come from the US Energy Information Administration.' : 'Gold\'s daily close, saved at 5pm New York time.'}</p>
+    <p class="lede">${market === 'oil' ? 'The official Brent spot price, for oil ready for delivery, from the US Energy Information Administration. It is published about a week late and can differ from the futures price at the top of the Brent page.' : 'Gold\'s daily close, saved at 5pm New York time.'}</p>
   </div></section>
   <div class="wrap narrow">
-    ${chart ? html`<figure class="daychart"><figcaption>${info.name}, US dollars per ${info.unitShort}</figcaption>${chart}</figure>` : html`<p class="empty">This chart fills in from the day the site goes live, one close at a time.</p>`}
-    ${rows.length ? html`<h2>Daily closes</h2><div class="table-wrap"><table>
-      <thead><tr><th scope="col">Date</th><th scope="col">Close</th><th scope="col">Change</th></tr></thead>
+    ${recent.length ? html`<h2>Futures price at 5pm New York</h2><div class="table-wrap"><table>
+      <thead><tr><th scope="col">Date</th><th scope="col">Close</th></tr></thead>
+      <tbody>${recent.map(([date, value]) => html`<tr><th scope="row">${longDate(date)}</th><td>${money(value, 'USD', 2)}</td></tr>`)}</tbody></table></div>` : ''}
+    ${chart ? html`<figure class="daychart"><figcaption>${market === 'oil' ? 'Brent spot price' : info.name}, US dollars per ${info.unitShort}</figcaption>${chart}</figure>` : html`<p class="empty">This chart fills in from the day the site goes live, one close at a time.</p>`}
+    ${rows.length ? html`<h2>${market === 'oil' ? 'Daily spot prices' : 'Daily closes'}</h2><div class="table-wrap"><table>
+      <thead><tr><th scope="col">Date</th><th scope="col">Price</th><th scope="col">Change</th></tr></thead>
       <tbody>${rows.slice(0, 60).map(([date, value], i) => {
         const prev = rows[i + 1]?.[1];
         const change = prev ? ((value - prev) / prev) * 100 : null;
-        return html`<tr><th scope="row">${longDate(date)}</th><td>${money(value, 'USD', digits)}</td><td class="${change === null ? '' : change >= 0 ? 'num-up' : 'num-down'}">${change === null ? '–' : pct(change)}</td></tr>`;
+        return html`<tr><th scope="row">${longDate(date)}</th><td>${money(value, 'USD', 2)}</td><td class="${change === null ? '' : change >= 0 ? 'num-up' : 'num-down'}">${change === null ? '–' : pct(change)}</td></tr>`;
       })}</tbody></table></div>` : ''}
   </div>`;
-  return layout({ config, state, market, path: market === 'oil' ? '/brent-oil-price-history' : '/gold-price-history', title: `${info.name} price history`, description: `Daily closing prices for ${info.lower}.`, body });
+  return layout({ config, state, market, path: market === 'oil' ? '/brent-oil-price-history' : '/gold-price-history', title: `${info.name} price history`, description: `Daily prices for ${info.lower}.`, body });
 }
 
 function guidesIndex({ state, config }) {
@@ -3428,7 +3484,7 @@ function createApp({ config, collector, now = () => new Date() }) {
         case '/terms': return page(termsPage(ctx));
         case '/status': return page(statusPage({ ...ctx, report: collector.statusReport() }));
         case '/robots.txt':
-          return send(req, res, 200, `User-agent: *\nAllow: /\nDisallow: /status\nDisallow: /api/\n${config.siteUrl ? `Sitemap: ${config.siteUrl}/sitemap.xml\n` : ''}`, { 'content-type': 'text/plain; charset=utf-8' });
+          return send(req, res, 200, `User-agent: *\nAllow: /\nDisallow: /api/\n${config.siteUrl ? `Sitemap: ${config.siteUrl}/sitemap.xml\n` : ''}`, { 'content-type': 'text/plain; charset=utf-8' });
         case '/sitemap.xml':
           return send(req, res, 200, sitemap(config, state), { 'content-type': 'application/xml; charset=utf-8' });
         default:
