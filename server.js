@@ -442,8 +442,10 @@ const WHY = {
   oilUpIran: 'Traders fear the Iran conflict will cut oil supply, so they are paying more for oil now.',
   opecCut: 'Less oil from the world\'s biggest producers means a tighter market, which pushes prices up.',
   opecRaise: 'More oil from the world\'s biggest producers means more supply, which pushes prices down.',
-  drawOil: 'US oil stocks fell when traders expected otherwise, a sign of tight supply or strong demand. That usually lifts oil.',
+  drawOil: 'US oil stocks came in lower than traders expected, a sign of tight supply or strong demand. That usually lifts oil.',
   buildOil: 'US oil stocks rose, a sign of weak demand or plenty of supply. That usually pushes oil down.',
+  smallDrawOil: 'US oil stocks fell by less than traders expected, a sign of softer demand or more supply. That usually pushes oil down.',
+  smallBuildOil: 'US oil stocks rose by less than traders expected, a sign of firmer demand or less supply. That usually lifts oil.',
   outage: 'An outage takes oil off the market, even if only for a while, and less supply usually lifts the price.',
   sanctionsOn: 'Tougher sanctions make it harder for this oil to reach buyers, so supply gets tighter.',
   sanctionsOff: 'Easier sanctions let more oil reach buyers, so supply gets looser.',
@@ -562,7 +564,10 @@ function inventoryRule(title) {
   }
   if (!dir) return null;
   const importance = beat && /\bEIA\b/.test(title) ? 'high' : 'medium';
-  return { theme: 'inventories', oil: dir === 'down' ? bull(importance, WHY.drawOil) : bear(importance, WHY.buildOil) };
+  const smaller = SMALLER_THAN.test(title);
+  const bullWhy = smaller ? WHY.smallBuildOil : WHY.drawOil;
+  const bearWhy = smaller ? WHY.smallDrawOil : WHY.buildOil;
+  return { theme: 'inventories', oil: dir === 'down' ? bull(importance, bullWhy) : bear(importance, bearWhy) };
 }
 
 function outageRule(title) {
@@ -1128,7 +1133,7 @@ function newDay(date) {
 
 function newState() {
   return {
-    version: 3,
+    version: 4,
     lastTickAt: null,
     firstTickDone: false,
     historySeeded: false,
@@ -1445,7 +1450,7 @@ class Collector {
       if (text) {
         const saved = JSON.parse(text);
         this.state = migrateState(saved);
-        if ((saved.version ?? 1) < 3 && !this.config.ai.key) this.#rereadStories();
+        if ((saved.version ?? 1) < 4 && !this.config.ai.key) this.#rereadStories();
       }
       this.loaded = true;
       this.storeError = null;
@@ -1475,6 +1480,12 @@ class Collector {
         post.readings = readings;
         post.theme = label.theme;
       }
+      // Oldest first, so the first report of a subject stands.
+      const kept = [];
+      for (const post of [...list].sort((a, b) => a.at.localeCompare(b.at))) {
+        if (post.type !== 'news' || !this.#contradicts(kept, post.theme, post.readings, new Date(post.at))) kept.push(post);
+      }
+      list.splice(0, list.length, ...kept);
     }
     state.recent = state.recent.filter((row) => classify(row.title));
     this.dirty = true;
@@ -1834,6 +1845,15 @@ class Collector {
     return best;
   }
 
+  // True when a smaller story points the opposite way to an earlier one on the same subject,
+  // such as two publishers reading one report differently. It would only be a mixed signal.
+  #contradicts(list, theme, readings, at) {
+    const present = MARKET_KEYS.filter((m) => readings[m]);
+    if (present.some((m) => readings[m].importance === 'high')) return false;
+    return list.some((p) => p.type === 'news' && p.theme === theme && Math.abs(at - new Date(p.at)) < 3 * HOUR
+      && present.some((m) => p.readings?.[m] && p.readings[m].verdict !== readings[m].verdict));
+  }
+
   publishNews(labelled, now, quiet) {
     const { state } = this;
     for (const { item, label } of labelled) {
@@ -1852,6 +1872,8 @@ class Collector {
         (earlier.related ??= []).push({ title: item.title, link: item.link, source: item.source });
         continue;
       }
+
+      if (this.#contradicts(list, label.theme, label, at)) continue;
 
       const readings = {};
       for (const market of MARKET_KEYS) {
