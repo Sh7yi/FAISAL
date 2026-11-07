@@ -4998,6 +4998,9 @@ const { createHash } = require('node:crypto');
 // G-, AW- and GT- ids load gtag.js instead.
 const isContainer = (id) => id.startsWith('GTM-');
 
+// Google Analytics, so you can see how many people visit. It loads next to the tag above.
+const ANALYTICS_ID = 'G-SZRQ44NRMK';
+
 // The small script that runs before the tag loads. The page's security rules allow exactly this text by its fingerprint.
 function tagSetup(id) {
   const lines = [
@@ -5007,6 +5010,7 @@ function tagSetup(id) {
   ];
   if (isContainer(id)) lines.push("dataLayer.push({'gtm.start': new Date().getTime(), event: 'gtm.js'});");
   else lines.push(`gtag('config', '${id}');`);
+  if (ANALYTICS_ID && ANALYTICS_ID !== id) lines.push(`gtag('config', '${ANALYTICS_ID}');`);
   return lines.join('\n');
 }
 
@@ -5019,7 +5023,10 @@ function tagHead(id) {
   const src = isContainer(id)
     ? `https://www.googletagmanager.com/gtm.js?id=${id}`
     : `https://www.googletagmanager.com/gtag/js?id=${id}`;
-  return `<script>${tagSetup(id)}</script>\n<script async src="${src}"></script>`;
+  const analytics = ANALYTICS_ID && ANALYTICS_ID !== id
+    ? `\n<script async src="https://www.googletagmanager.com/gtag/js?id=${ANALYTICS_ID}"></script>`
+    : '';
+  return `<script>${tagSetup(id)}</script>\n<script async src="${src}"></script>${analytics}`;
 }
 
 function tagBody(id) {
