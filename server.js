@@ -10,7 +10,7 @@
 const SITE_SETTINGS = {
   "name": "Gold & Oil Verdict",
   "tagline": "Why gold and Brent oil are moving today, in plain English.",
-  "siteUrl": "",
+  "siteUrl": "https://www.5brgold.com",
   "telegramUrl": "",
   "googleTagId": "GTM-5KWK58P2",
   "contactEmail": "",
