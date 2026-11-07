@@ -12,6 +12,7 @@ const SITE_SETTINGS = {
   "tagline": "Why gold and Brent oil are moving today, in plain English.",
   "siteUrl": "",
   "telegramUrl": "",
+  "googleTagId": "GTM-5KWK58P2",
   "contactEmail": "",
   "timeZone": "Asia/Dubai",
   "timeZoneLabel": "Gulf time",
@@ -139,6 +140,9 @@ function loadConfig(env = process.env) {
   const channelId = (env.TELEGRAM_CHANNEL_ID || '').trim();
   const channelUrl = site.telegramUrl || env.TELEGRAM_CHANNEL_URL || (/^@\w{4,}$/.test(channelId) ? `https://t.me/${channelId.slice(1)}` : '');
   const adsClient = /^ca-pub-\d{10,20}$/.test(env.ADSENSE_CLIENT ?? '') ? env.ADSENSE_CLIENT : '';
+  // The Google tag for Google Ads. GOOGLE_TAG_ID on Render replaces the one in site.config.json, and "off" removes it.
+  const tagId = String(env.GOOGLE_TAG_ID ?? site.googleTagId ?? '').trim().toUpperCase();
+  const googleTag = /^(GTM|G|AW|GT|DC)-[A-Z0-9]{4,20}$/.test(tagId) ? tagId : '';
   return {
     ...site,
     siteUrl,
@@ -146,6 +150,7 @@ function loadConfig(env = process.env) {
     customDomain: Boolean(site.siteUrl || env.SITE_URL),
     renderUrl: (env.RENDER_EXTERNAL_URL || '').replace(/\/$/, ''),
     ads: { client: adsClient },
+    googleTag,
     askDailyLimit: Number(env.ASK_DAILY_LIMIT) || site.askDailyLimit || 150,
     sources,
     port: Number(env.PORT) || 3000,
@@ -4985,12 +4990,66 @@ function historyChart(closes, market = 'gold') {
   return { dayChart, historyChart };
 })();
 
+// ---------- src-views-tag.js ----------
+__modules['src-views-tag.js'] = (() => {
+const { createHash } = require('node:crypto');
+
+// The Google tag, so Google Ads can see visits from its ads. A GTM- id is a Tag Manager container;
+// G-, AW- and GT- ids load gtag.js instead.
+const isContainer = (id) => id.startsWith('GTM-');
+
+// The small script that runs before the tag loads. The page's security rules allow exactly this text by its fingerprint.
+function tagSetup(id) {
+  const lines = [
+    'window.dataLayer = window.dataLayer || [];',
+    'function gtag(){dataLayer.push(arguments);}',
+    "gtag('js', new Date());",
+  ];
+  if (isContainer(id)) lines.push("dataLayer.push({'gtm.start': new Date().getTime(), event: 'gtm.js'});");
+  else lines.push(`gtag('config', '${id}');`);
+  return lines.join('\n');
+}
+
+function tagHash(id) {
+  return `'sha256-${createHash('sha256').update(tagSetup(id)).digest('base64')}'`;
+}
+
+function tagHead(id) {
+  if (!id) return '';
+  const src = isContainer(id)
+    ? `https://www.googletagmanager.com/gtm.js?id=${id}`
+    : `https://www.googletagmanager.com/gtag/js?id=${id}`;
+  return `<script>${tagSetup(id)}</script>\n<script async src="${src}"></script>`;
+}
+
+function tagBody(id) {
+  if (!id || !isContainer(id)) return '';
+  return `<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=${id}" height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>`;
+}
+
+// Google's own list of what its tag needs to reach, for Tag Manager, Analytics and Google Ads,
+// plus Tag Manager's preview mode so the tag can be tested.
+const GOOGLE_TLDS = ['google.ae', 'google.com.sa', 'google.com.kw', 'google.com.qa', 'google.com.bh', 'google.com.om', 'google.co.uk', 'google.co.in', 'google.com.pk', 'google.com.eg'];
+const TLD_HOSTS = GOOGLE_TLDS.map((d) => `https://*.${d}`);
+
+const TAG_SOURCES = {
+  script: ['https://www.googletagmanager.com', 'https://tagmanager.google.com', 'https://www.googleadservices.com', 'https://www.google.com', 'https://googleads.g.doubleclick.net'],
+  style: ['https://www.googletagmanager.com', 'https://tagmanager.google.com'],
+  font: ['data:'],
+  img: ['https://www.googletagmanager.com', 'https://*.google-analytics.com', 'https://*.google.com', ...TLD_HOSTS, 'https://*.g.doubleclick.net', 'https://www.googleadservices.com', 'https://pagead2.googlesyndication.com', 'https://ssl.gstatic.com', 'https://www.gstatic.com'],
+  connect: ['https://www.googletagmanager.com', 'https://*.google-analytics.com', 'https://*.analytics.google.com', 'https://*.google.com', ...TLD_HOSTS, 'https://*.g.doubleclick.net', 'https://ad.doubleclick.net', 'https://www.googleadservices.com', 'https://pagead2.googlesyndication.com'],
+  frame: ['https://www.googletagmanager.com', 'https://td.doubleclick.net'],
+};
+  return { tagSetup, tagHash, tagHead, tagBody, TAG_SOURCES };
+})();
+
 // ---------- src-views-layout.js ----------
 __modules['src-views-layout.js'] = (() => {
 const { html, raw, esc } = __modules['src-lib-html.js'];
 const { changes, lastUpdate, MARKETS, priceOf } = __modules['src-core-state.js'];
 const { isMarketDay } = __modules['src-lib-time.js'];
 const { browserTexts, isArabicPath, langPath, t } = __modules['src-i18n.js'];
+const { tagBody, tagHead } = __modules['src-views-tag.js'];
 
 // Line icons for the menu. They take the text colour, so they work in both states.
 const ICON = {
@@ -5094,6 +5153,7 @@ function layout({ config, state, title, description, path = '/', body, noindex =
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+${raw(tagHead(config.googleTag))}
 <title>${fullTitle}</title>
 <meta name="description" content="${description ?? config.tagline}">
 ${noindex ? raw('<meta name="robots" content="noindex">') : ''}
@@ -5124,6 +5184,7 @@ ${head}
 <script src="/app.js?v=${version}" defer></script>
 </head>
 <body>
+${raw(tagBody(config.googleTag))}
 <a class="skip" href="#main">${t(lang, 'skip')}</a>
 <header class="top">
   <div class="wrap top-inner">
@@ -6388,8 +6449,11 @@ const privacyPage = ({ state, config }) => simplePage({
   state, config, path: '/privacy', title: 'Privacy', description: `How ${config.name} handles your information.`,
   paragraphs: [
     ['p', config.ads?.client
-      ? `${config.name} has no accounts and no analytics. It shows adverts from Google AdSense. Google may use cookies to show and measure those adverts. You can manage this at https://adssettings.google.com.`
-      : `${config.name} has no accounts, no adverts, no analytics and no tracking cookies.`],
+      ? `${config.name} has no accounts. It shows adverts from Google AdSense. Google may use cookies to show and measure those adverts. You can manage this at https://myadcenter.google.com.`
+      : config.googleTag
+        ? `${config.name} has no accounts and shows no adverts.`
+        : `${config.name} has no accounts, no adverts, no analytics and no tracking cookies.`],
+    ...(config.googleTag ? [['p', `${config.name} advertises on Google. It uses the Google tag (Google Tag Manager) to count visits that come from those ads. Google may set cookies and collect details such as your IP address and the pages you open to measure this. You can manage how Google uses your data at https://myadcenter.google.com.`]] : []),
     ['p', 'Your chosen currency, chart type and story filter are saved in your own browser so the page remembers them. They are never sent to us.'],
     ['p', 'If you use the question box or "Explain more", your question and the story are sent to Anthropic, which runs Claude, to write the answer. Do not type personal details into it. Questions are not saved by this site, and a short count per visitor is kept in memory to stop misuse.'],
     ['h2', 'Other services your browser contacts'],
@@ -6431,6 +6495,7 @@ function statusPage({ state, config, report }) {
       <tr><th scope="row">Releases recorded</th><td>${report.releases}</td></tr>
       <tr><th scope="row">Own domain</th><td>${report.domain ?? 'Not set'}</td></tr>
       <tr><th scope="row">Ads</th><td>${report.ads ? 'On' : 'Off'}</td></tr>
+      <tr><th scope="row">Google tag</th><td>${config.googleTag ? `On (${config.googleTag})` : 'Off'}</td></tr>
       <tr><th scope="row">Posts today</th><td>${report.postsToday}</td></tr>
       <tr><th scope="row">Price checks today</th><td>Gold ${report.goldChecks}, Brent ${report.oilChecks}</td></tr>
       <tr><th scope="row">Daily closes saved</th><td>Gold ${report.closes}, Brent ${report.oilCloses}</td></tr>
@@ -6469,37 +6534,36 @@ const { aboutPage, calculatorPage, calendarPage, cheatSheetPage, countryPage, CO
 const { isValidDate } = __modules['src-lib-time.js'];
 const { GUIDES } = __modules['src-content-guides.js'];
 const { isArabicPath, langPath } = __modules['src-i18n.js'];
+const { tagHash, TAG_SOURCES } = __modules['src-views-tag.js'];
 
 const SECURITY = {
   'x-content-type-options': 'nosniff',
   'referrer-policy': 'strict-origin-when-cross-origin',
   'x-frame-options': 'DENY',
-  'content-security-policy': [
-    "default-src 'self'",
-    "script-src 'self'",
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-    'font-src https://fonts.gstatic.com',
-    'img-src \'self\' data:',
-    'connect-src \'self\' https://api.gold-api.com',
-    "frame-ancestors 'none'",
-    "base-uri 'self'",
-    "form-action 'none'",
-  ].join('; '),
 };
 
-// With adverts switched on, Google's ad scripts and frames have to be allowed.
-const ADS_POLICY = [
-  "default-src 'self'",
-  "script-src 'self' https:",
-  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-  'font-src https://fonts.gstatic.com',
-  "img-src 'self' data: https:",
-  "connect-src 'self' https:",
-  'frame-src https:',
-  "frame-ancestors 'none'",
-  "base-uri 'self'",
-  "form-action 'none'",
-].join('; ');
+const unique = (list) => [...new Set(list.filter(Boolean))].join(' ');
+
+// The page's security rules: what the browser may load. Adverts need any Google address allowed;
+// the Google tag needs Google's own list, and its small setup script is allowed by its fingerprint.
+function contentPolicy(config = {}) {
+  const ads = Boolean(config.ads?.client);
+  const tag = config.googleTag || '';
+  const extra = (key) => (tag ? TAG_SOURCES[key] : []);
+  const rules = [
+    "default-src 'self'",
+    `script-src ${unique(["'self'", tag && tagHash(tag), ...(ads ? ['https:'] : extra('script'))])}`,
+    `style-src ${unique(["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com', ...extra('style')])}`,
+    `font-src ${unique(['https://fonts.gstatic.com', ...extra('font')])}`,
+    `img-src ${unique(["'self'", 'data:', ...(ads ? ['https:'] : extra('img'))])}`,
+    `connect-src ${unique(["'self'", ...(ads ? ['https:'] : ['https://api.gold-api.com', ...extra('connect')])])}`,
+  ];
+  if (ads || tag) rules.push(`frame-src ${unique(ads ? ['https:'] : extra('frame'))}`);
+  rules.push("frame-ancestors 'none'", "base-uri 'self'", "form-action 'none'");
+  return rules.join('; ');
+}
+
+const STRICT_POLICY = contentPolicy();
 
 function send(req, res, status, body, headers = {}) {
   const text = typeof body === 'string' || Buffer.isBuffer(body) ? body : String(body);
@@ -6511,7 +6575,7 @@ function send(req, res, status, body, headers = {}) {
     'content-type': type,
     'cache-control': 'no-cache',
     ...SECURITY,
-    ...(req.ads ? { 'content-security-policy': ADS_POLICY } : {}),
+    'content-security-policy': req.csp ?? STRICT_POLICY,
     ...headers,
     ...(compress ? { 'content-encoding': 'gzip', vary: 'accept-encoding' } : {}),
     'content-length': payload.length,
@@ -6580,9 +6644,10 @@ function sameSite(req) {
 }
 
 function createApp({ config, collector, now = () => new Date() }) {
+  const policy = contentPolicy(config);
   return async function handle(req, res) {
     try {
-      req.ads = Boolean(config.ads?.client);
+      req.csp = policy;
       const json = (status, body) => send(req, res, status, JSON.stringify(body), { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
       if (req.method === 'POST' && (req.url === '/api/ask' || req.url === '/api/explain')) {
         if (!sameSite(req)) return json(403, { error: 'forbidden' });
@@ -6745,5 +6810,5 @@ function start(config = loadConfig()) {
 }
 
 start();
-  return { createApp, start };
+  return { contentPolicy, createApp, start };
 })();
