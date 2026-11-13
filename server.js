@@ -6124,11 +6124,14 @@ function tradingPage({ state, config, lang = 'en' }) {
 // The technical analysis page: TradingView's live gauges and charts, which update by themselves,
 // and the latest analysts' views from other sites (headline and link only).
 const TV_SYMBOLS = { gold: 'OANDA:XAUUSD', oil: 'TVC:UKOIL' };
+// The gauge has no data for TVC:UKOIL, so it reads FXCM's Brent price instead.
+const TV_GAUGE = { gold: 'OANDA:XAUUSD', oil: 'FX:UKOIL' };
 const safeLink = (url) => (/^https?:\/\//i.test(url ?? '') ? url : null);
 
 function tvWidget(kind, settings, height) {
   const json = JSON.stringify(settings).replace(/</g, '\\u003c');
-  return raw(`<div class="tradingview-widget-container" style="height:${height}px;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div><script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-${kind}.js" async>${json}</script></div>`);
+  // TradingView rewrites the container to height:100%, so the fixed height lives on an outer box.
+  return raw(`<div class="ta-frame" style="height:${height}px;width:100%;position:relative;border-radius:12px;overflow:hidden"><div class="tradingview-widget-container" style="height:100%;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div><script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-${kind}.js" async>${json}</script></div></div>`);
 }
 
 const TA_TEXT = {
@@ -6164,10 +6167,10 @@ function analysisPage({ state, config, lang = 'en' }) {
   const block = (market) => {
     const symbol = TV_SYMBOLS[market];
     const items = (state.analysis ?? []).filter((a) => a.market === market).slice(0, 10);
-    return html`<section class="ta-market" id="ta-${market}">
+    return html`<section class="ta-market" id="ta-${market}" style="margin:28px 0 36px">
       <h2>${L[market]}</h2>
       <div class="ta-grid" style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));align-items:start">
-        <div><h3>${L.gauge}</h3>${tvWidget('technical-analysis', { interval: '15m', width: '100%', isTransparent: true, height: '100%', symbol, showIntervalTabs: true, displayMode: 'single', locale, colorTheme: 'dark' }, 450)}</div>
+        <div><h3>${L.gauge}</h3>${tvWidget('technical-analysis', { interval: '15m', width: '100%', isTransparent: false, height: '100%', symbol: TV_GAUGE[market], showIntervalTabs: true, displayMode: 'single', locale, colorTheme: 'dark' }, 450)}</div>
         <div><h3>${L.chart}</h3>${tvWidget('advanced-chart', { autosize: true, symbol, interval: '15', timezone: 'Asia/Dubai', theme: 'dark', style: '1', locale, backgroundColor: 'rgba(0, 0, 0, 0)', allow_symbol_change: false, calendar: false, hide_volume: true, support_host: 'https://www.tradingview.com' }, 450)}</div>
       </div>
       <h3>${L.views}</h3>
