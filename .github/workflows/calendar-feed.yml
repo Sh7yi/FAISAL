@@ -1,0 +1,38 @@
+# Keeps a copy of this week's economic calendar on the "feeds" branch, refreshed every hour.
+# The website reads this copy first, because the original feed often turns away shared servers like Render's.
+name: Calendar feed
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: calendar-feed
+  cancel-in-progress: true
+
+jobs:
+  calendar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download this week's calendar
+        run: |
+          for attempt in 1 2 3 4; do
+            if curl -fsS -m 30 -A "5brgold-calendar/1.0 (+https://www.5brgold.com)" -o ff.json https://nfs.faireconomy.media/ff_calendar_thisweek.json; then break; fi
+            sleep 45
+          done
+          python3 -c "import json; d = json.load(open('ff.json')); assert isinstance(d, list) and d, 'empty'; print(len(d), 'events')"
+      - name: Publish to the feeds branch
+        run: |
+          mkdir out && cd out
+          git init -q -b feeds
+          git config user.name "calendar-feed"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp ../ff.json ff_calendar_thisweek.json
+          git add ff_calendar_thisweek.json
+          git commit -qm "Calendar $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" feeds
