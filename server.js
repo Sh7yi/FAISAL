@@ -1342,6 +1342,21 @@ class Engine {
     }
   }
 
+  async testTelegram() {
+    if (!this.config.telegram.token || !this.config.telegram.chatId) {
+      this.net.mark('Telegram alerts', false, 'TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set');
+      return { ok: false, message: 'TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing on Render.' };
+    }
+    try {
+      await sendTelegram(this.net, this.config, `✅ Test from ${this.config.siteName}: alerts are working. You'll get a message for every BUY NOW and WAIT signal, your trade targets and stops, and a summary before the US open.\n${this.config.siteUrl}`);
+      this.net.mark('Telegram alerts', true, 'test message sent');
+      return { ok: true, message: 'Test message sent — check Telegram.' };
+    } catch (error) {
+      this.net.mark('Telegram alerts', false, error.message);
+      return { ok: false, message: error.message };
+    }
+  }
+
   // ---------- your trades ----------
   addTrade({ symbol, price, date }) {
     const sym = String(symbol ?? '').toUpperCase().trim();
@@ -2098,7 +2113,13 @@ function createServer(engine) {
       }
       if (path === '/watchlist') return send(res, 200, String(pages.watchlistPage({ engine, sort: url.searchParams.get('sort') ?? 'news' })));
       if (path === '/scorecard') return send(res, 200, String(pages.scorecardPage({ engine })));
-      if (path === '/status') return send(res, 200, String(pages.statusPage({ engine })));
+      if (path === '/status/test-telegram' && req.method === 'POST') {
+        const origin = req.headers.origin ?? req.headers.referer ?? '';
+        if (origin && !origin.includes(req.headers.host ?? '')) return send(res, 403, 'Forbidden', 'text/plain');
+        const result = await engine.testTelegram();
+        return redirect(res, `/status?tg=${result.ok ? 'ok' : 'fail'}&m=${encodeURIComponent(result.message)}`);
+      }
+      if (path === '/status') return send(res, 200, String(pages.statusPage({ engine, tg: url.searchParams.get('tg'), tgMessage: url.searchParams.get('m') ?? '' })));
       const m = path.match(/^\/s\/([A-Za-z0-9.\-]{1,10})$/);
       if (m) {
         const data = await engine.stock(m[1]);
@@ -2816,7 +2837,11 @@ async function sendTelegram(net, config, text) {
     retries: 1,
     ua: 'halal-swing-site',
   });
-  if (!response.ok) throw new Error(`Telegram answered ${response.status}`);
+  if (!response.ok) {
+    let reason = '';
+    try { reason = (await response.json())?.description ?? ''; } catch {}
+    throw new Error(`Telegram answered ${response.status}${reason ? `: ${reason}` : ''}`);
+  }
   return true;
 }
 
@@ -3503,11 +3528,13 @@ function explodeTemplate(config) {
   const ex = explodeCheck({ cls: { impact: 0, horizon: 'days' }, ta: null, fund: null, dilution: null, market: null, sector: null, levels: null, candles: null, config });
   return { ...ex, items: ex.items.map((i) => ({ ...i, status: 'na', note: '' })) };
 }
-function statusPage({ engine }) {
+function statusPage({ engine, tg = null, tgMessage = '' }) {
   const { state, config } = engine;
   const health = Object.entries(engine.net.health).sort(([a], [b]) => a.localeCompare(b));
   const body = html`<h1>Status</h1>
 <p class="sub">Whether each data source answered on its last check. Started ${dubaiTime(engine.started)}.</p>
+${tg ? html`<div class="bubble ${tg === 'ok' ? 'good' : 'bad'}" style="margin:10px 0"><b>${tg === 'ok' ? '✅ Telegram works' : '❌ Telegram failed'}</b><br><span class="small">${tgMessage}</span></div>` : ''}
+<form method="post" action="/status/test-telegram" style="margin:10px 0 16px"><button type="submit">Send a test Telegram alert</button></form>
 ${setupBox(engine.setupStatus())}
 <div class="bubbles">
 <div class="bubble"><div class="k">XTB US real shares</div><div class="v">${state.xtb.symbols.length}</div><div class="small muted">${state.xtb.updatedAt ? timeAgo(state.xtb.updatedAt) : 'not loaded'}</div></div>
