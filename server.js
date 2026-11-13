@@ -478,6 +478,8 @@ function loadConfig(env = process.env) {
     siteName: env.SITE_NAME || 'Halal Swing',
     siteUrl: (env.SITE_URL || 'https://www.5brgold.com').replace(/\/$/, ''),
     password: String(env.SITE_PASSWORD ?? ''),
+    // The owner chose an open site (no login). Set REQUIRE_PASSWORD=true on Render to lock it again.
+    requirePassword: String(env.REQUIRE_PASSWORD ?? '').toLowerCase() === 'true',
     maxPrice: num(env.MAX_PRICE, 20),
     minPrice: num(env.MIN_PRICE, 0.2),
     minImpact: num(env.MIN_IMPACT, 7),
@@ -1091,7 +1093,7 @@ class Engine {
   setupStatus() {
     const c = this.config;
     return [
-      { key: 'SITE_PASSWORD', ok: Boolean(c.password), what: 'Locks the site so only you can open it.' },
+      ...(c.requirePassword ? [{ key: 'SITE_PASSWORD', ok: Boolean(c.password), what: 'Locks the site so only you can open it.' }] : []),
       { key: 'ZOYA_API_KEY', ok: Boolean(c.zoya.key) && !c.zoya.sandbox, what: 'Halal ratings. Without it no stocks are shown.' },
       { key: 'ALPACA_KEY_ID + ALPACA_SECRET_KEY', ok: alpaca.enabled(c), what: 'Real-time Benzinga news (free account).' },
       { key: 'ANTHROPIC_API_KEY', ok: Boolean(c.ai.key), what: 'Claude reads each headline.' },
@@ -1654,7 +1656,7 @@ function createServer(engine) {
         return send(res, 200, JSON.stringify({
           ok: true,
           started: engine.started,
-          locked: !config.password,
+          locked: config.requirePassword,
           universe: engine.state.universe.symbols.length,
           xtb: engine.state.xtb.symbols.length,
           halal: engine.state.halal.count ?? 0,
@@ -1663,9 +1665,9 @@ function createServer(engine) {
         }), 'application/json');
       }
 
-      if (!config.password) return send(res, 503, String(pages.loginPage({ config, locked: true })));
+      if (config.requirePassword && !config.password) return send(res, 503, String(pages.loginPage({ config, locked: true })));
 
-      if (path === '/login' && req.method === 'POST') {
+      if (config.requirePassword && path === '/login' && req.method === 'POST') {
         if (tooMany(clientIp(req))) return send(res, 429, String(pages.loginPage({ config, error: 'Too many tries. Wait 15 minutes.' })));
         const form = new URLSearchParams(await readBody(req));
         if (!samePassword(form.get('password') ?? '', config.password)) {
@@ -1674,16 +1676,16 @@ function createServer(engine) {
         const cookie = `${COOKIE}=${makeSession(config.password)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}${secure ? '; Secure' : ''}`;
         return redirect(res, '/', { 'set-cookie': cookie });
       }
-      if (path === '/logout' && req.method === 'POST') {
+      if (config.requirePassword && path === '/logout' && req.method === 'POST') {
         return redirect(res, '/login', { 'set-cookie': `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}` });
       }
 
-      const authed = validSession(config.password, cookies(req)[COOKIE]);
+      const authed = !config.requirePassword || validSession(config.password, cookies(req)[COOKIE]);
       if (!authed) {
         if (path === '/api/version') return send(res, 401, '{}', 'application/json');
         return send(res, 200, String(pages.loginPage({ config })));
       }
-      if (path === '/login') return redirect(res, '/');
+      if (path === '/login' || path === '/logout') return redirect(res, '/');
 
       if (path === '/api/version') return send(res, 200, JSON.stringify({ v: engine.version }), 'application/json');
 
@@ -2602,8 +2604,8 @@ function layout({ title, active = '/', body, config, version = '' }) {
 <nav class="tabs">${NAV.map(([href, label]) => html`<a href="${href}" class="${href === active ? 'on' : ''}">${label}</a>`)}</nav>
 </div></header>
 <main><div class="wrap">${body}</div></main>
-<footer><div class="wrap">Private tool for one person. Halal ratings: Zoya (AAOIFI), only COMPLIANT stocks are shown. Real shares on XTB only, no CFDs. Prices may be delayed. This is not financial advice — every trade is your own decision.
-<form method="post" action="/logout" style="margin-top:10px"><button class="ghost" type="submit">Log out</button></form></div></footer>
+<footer><div class="wrap">Personal tool, hidden from search engines. Halal ratings: Zoya (AAOIFI), only COMPLIANT stocks are shown. Real shares on XTB only, no CFDs. Prices may be delayed. This is not financial advice — every trade is your own decision.
+${config.requirePassword ? html`<form method="post" action="/logout" style="margin-top:10px"><button class="ghost" type="submit">Log out</button></form>` : ''}</div></footer>
 <div class="newpill" id="newpill">↻ New signal — tap to refresh</div>
 <script src="/app.js?v=${config.assetVersion}"></script>
 </body></html>`;
