@@ -86,14 +86,22 @@ const DATA_SOURCES = {
     {
       "name": "The Maritime Executive",
       "url": "https://maritime-executive.com/articles.rss"
-    },
-    {
-      "name": "Yahoo Finance",
-      "url": "https://finance.yahoo.com/news/rssindex"
     }
   ],
   "goldApi": "https://api.gold-api.com",
   "calendar": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+  "calendarMirror": "https://raw.githubusercontent.com/Sh7yi/FAISAL/feeds/ff_calendar_thisweek.json",
+  "analysis": [
+    {
+      "name": "Investing.com Commodities Analysis",
+      "url": "https://www.investing.com/rss/commodities.rss"
+    },
+    {
+      "name": "FXStreet",
+      "url": "https://www.fxstreet.com/rss/news",
+      "onlyAnalysis": true
+    }
+  ],
   "fx": "https://open.er-api.com/v6/latest/USD",
   "fred": "https://fred.stlouisfed.org/graph/fredgraph.csv",
   "anthropic": "https://api.anthropic.com/v1/messages",
@@ -818,7 +826,81 @@ function sameStory(a, b) {
   for (const w of x) if (y.has(w)) shared++;
   return shared / (x.size + y.size - shared) >= 0.5;
 }
-  return { isNoise, parseResult, extractActual, figureOf, TIMINGS, timingOf, classify, isMacroHeadline, titleTokens, sameStory };
+  // ---- Strict filter (added 13 Nov 2026) ----
+// Runs after the rules above, and after Claude when the AI reader is on. Only news that can
+// really move gold or Brent gets through. A reading is dropped rather than shown as a maybe.
+const GOLD_CORE = /\b(gold|bullion|xau(\/?usd)?|precious metals?)\b/i;
+const OIL_CORE = /\b(oil|crude|brent|wti|opec\+?|barrels?|refiner(y|ies)|tankers?|hormuz|pipelines?|gasoline|distillates?|cushing|rig counts?|aramco|lng|petroleum|fuel)\b/i;
+const SUPPLY_PLACES = /\b(iran\w*|irgc|revolutionary guards?|gulf|hormuz|houthi\w*|red sea|saudi\w*|iraq\w*|kuwait\w*|qatar\w*|uae|emirat\w*|bahrain\w*|oman\w*|yemen\w*|israel\w*|russia\w*|ukrain\w*|venezuel\w*|libya\w*|nigeria\w*|kazakh\w*|sanction\w*|embargo)\b/i;
+const FED_SPEAKER = /\b(fed|fed's|federal reserve|fomc|powell|warsh|jefferson|bowman|waller|barr|cook|kugler|miran|williams|hammack|logan|goolsbee|daly|bostic|musalem|schmid|kashkari|harker|barkin|collins|paulson|beige book)\b/i;
+const FED_TOP = /\b(fomc|powell|warsh|fed chair\w*|rate decision|decides?|holds? rates|raises? rates|cuts? rates|dot plot|minutes|statement)\b/i;
+const US_RELEASE = /\b(nonfarm|non-farm|payrolls|jobless claims|initial claims|continuing claims|core pce|pce|jolts|adp|ism|michigan|conference board|durable goods|beige book|fomc)\b/i;
+const MACRO_THEMES = new Set(['fed', 'inflation', 'jobs', 'us-data', 'dollar', 'yields', 'recession', 'fiscal']);
+const OIL_THEMES = new Set(['oil', 'iran', 'opec', 'inventories', 'supply', 'sanctions', 'oil-demand', 'conflict']);
+const OFF_TOPIC = /\b(bitcoin|crypto\w*|ethereum|stocks?|shares|equit(y|ies)|nikkei|nasdaq|s&p 500|dow jones|ftse|dax|earnings|ipo|nvidia|apple|tesla|electric vehicles?|ev tariffs?|real estate|housing market|football|sports?)\b/i;
+const NOT_NEWS = /\blive(:|\s+updates?\b|\s+blog\b|\s+[-–—])|\bas it happened\b|\bwhat we know\b|\bexplainer\b|\banalysis:|\bopinion\b|\bcolumn\b|\bpreview\b|\bweek ahead\b|\bmorning (brief|wrap)\b|\bpodcast\b|\bwatch:/i;
+const PRICE_SUBJECT = /^(?:[A-Za-z' ]{0,24}[:\-–—]\s*)?(?:spot\s+|us\s+|u\.s\.\s+)?(gold|bullion|oil|crude(?: oil)?|brent(?: crude)?|wti|oil prices?|gold prices?|crude prices?|precious metals?|xau\/?usd)\b(?!\s+(?:oil\s+|crude\s+)?(inventor\w*|stocks?|stockpiles?|imports?|exports?|output|production|supply|supplies|demand|reserves?|shipments?|flows?|loadings?|futures curve|refiners?|workers?|companies|majors?|firms?))/i;
+const PRICE_VERB = /\b(rise|rises|rose|rising|climb\w*|jump\w*|surg\w*|soar\w*|spik\w*|gain\w*|rall\w*|rebound\w*|recover\w*|fall|falls|fell|falling|drop\w*|slid\w*|slide\w*|slip\w*|sink\w*|sank|tumbl\w*|plung\w*|slump\w*|dip\w*|ease|eases|eased|easing|edge\w*|hold|holds|holding|steady|steadies|steadied|extend\w*|pare\w*|turn\w*|hits?|cling\w*|hover\w*|retreat\w*|advance\w*|firm\w*|weak\w*|on track|set for|heads? for|poised)\b/i;
+const HAWKISH_TALK = /\b(restrictive|tighten\w*|higher for longer|more (rate )?(hikes?|increases?)|further (rate )?(hikes?|increases?)|raise rates|rate hikes? (are |is )?(needed|warranted|appropriate|likely)|(lower|bring down|reduce|tame|curb|cool|fight|beat|squeeze out) (high |stubborn |sticky )?inflation|inflation (is |remains |stays )?(too high|stubborn\w*|sticky|elevated)|stubbornly high|(still|more) work to do)\b/i;
+const DOVISH_TALK = /\b(rate cuts?|cut rates|cutting rates|dovish|ease policy|easing (cycle|policy)|pause hikes|no (more |further )?(rate )?hikes?|done (hiking|raising)|end of hikes|hikes? (are |is )?over)\b/i;
+
+// True when a headline only reports a move in the price itself, such as "Gold tumbles $112".
+function isRecap(title) {
+  return PRICE_SUBJECT.test(title) && PRICE_VERB.test(title.slice(0, 70));
+}
+
+function strictGate(title, label) {
+  if (!label || !title) return null;
+  if (NOT_NEWS.test(title)) return null;
+  const recap = isRecap(title);
+  // A bare price report adds nothing: the price box already shows the move.
+  if (recap && !HAS_REASON.test(title)) return null;
+
+  const out = { ...label };
+  let theme = out.theme ?? '';
+  const fedTalk = FED_SPEAKER.test(title);
+  const usMarked = US.test(title) || US_RELEASE.test(title) || fedTalk;
+
+  // A Fed official saying policy must stay tight is hawkish, whatever other words appear.
+  if (fedTalk && HAWKISH_TALK.test(title) && !DOVISH_TALK.test(title)) {
+    const importance = FED_TOP.test(title) ? 'high' : 'medium';
+    const keep = out.gold?.verdict === 'bearish' ? out.gold : null;
+    out.gold = keep ? { ...keep, importance } : bear(importance, WHY.hawkish);
+    theme = 'fed';
+    out.theme = 'fed';
+  } else if (fedTalk && out.gold && !FED_TOP.test(title) && out.gold.importance === 'high') {
+    // Regional Fed presidents rarely move gold much on their own.
+    out.gold = { ...out.gold, importance: 'medium' };
+  }
+
+  if (out.gold) {
+    let keepGold = true;
+    // US data, the Fed, yields and the dollar move gold. The same data from other countries mostly does not.
+    if (MACRO_THEMES.has(theme) && theme !== 'dollar' && !usMarked) keepGold = false;
+    // Gulf and supply shocks pull gold two ways at once (safe haven against higher rates), so no call.
+    if (OIL_THEMES.has(theme) && !GOLD_CORE.test(title) && !/\b(dollar|yields?|fed|rates?)\b/i.test(title)) keepGold = false;
+    if (OFF_TOPIC.test(title) && !GOLD_CORE.test(title)) keepGold = false;
+    if (theme === 'trade' && !usMarked) keepGold = false;
+    if (!keepGold) delete out.gold;
+  }
+
+  if (out.oil) {
+    let keepOil = OIL_CORE.test(title) || SUPPLY_PLACES.test(title);
+    if (OFF_TOPIC.test(title) && !OIL_CORE.test(title)) keepOil = false;
+    if (!keepOil) delete out.oil;
+  }
+
+  if (!out.gold && !out.oil) return null;
+  // A report of a move that already happened explains it, but cannot be scored as a call.
+  if (recap) {
+    for (const market of ['gold', 'oil']) {
+      if (out[market]) out[market] = { ...out[market], recap: true, noScore: true };
+    }
+  }
+  return out;
+}
+
+return { isNoise, parseResult, extractActual, figureOf, TIMINGS, timingOf, classify, isMacroHeadline, titleTokens, sameStory, strictGate, isRecap };
 })();
 
 // ---------- src-collector-ai.js ----------
@@ -835,7 +917,8 @@ For each headline give a separate reading for gold and for Brent oil. A reading 
 - why: one or two short sentences, at most 30 words, that a beginner understands. No jargon. Do not predict the price.
 - timing: when the effect usually reaches the price. "now" means within hours, such as a data surprise, a Fed decision or an attack on tankers. "days" means within a few days. "weeks" means over the coming weeks, such as an OPEC+ decision that changes supply next month. "months" means slowly over months, such as central bank buying or a long-range demand forecast.
 
-Reasoning for gold: it pays no interest and is priced in dollars. Higher US interest rates or yields and a stronger dollar usually hurt it; lower rates and a weaker dollar usually help it. An oil shock usually hurts gold because it feeds inflation and keeps rates high.
+Reasoning for gold: it pays no interest and is priced in dollars. Higher US interest rates or yields and a stronger dollar usually hurt it; lower rates and a weaker dollar usually help it. For news about the Gulf, Iran, tankers, OPEC or oil supply, give no gold reading (null) unless the headline itself names gold, the dollar, yields or the Fed: the safe-haven pull and the inflation pull work against each other, so the direction is not clear.
+Drop economic data from countries other than the US, and drop headlines that only report a price move without saying why. A Fed official saying policy must stay restrictive, or that rates must rise to bring inflation down, is hawkish and bearish for gold.
 Reasoning for oil: less supply, more demand, or war in the Gulf usually lifts it. More supply, weaker demand, or peace in the Gulf usually pushes it down.
 
 Also give theme: one of fed, inflation, jobs, us-data, dollar, yields, oil, iran, opec, inventories, supply, sanctions, oil-demand, gold-flows, gold-move, conflict, trade, fiscal, recession.
@@ -1527,13 +1610,17 @@ function storyPool(state, now = new Date()) {
 
 const postsFor = (day, market) => (day?.posts ?? []).filter((p) => (p.type === 'news' ? Boolean(p.readings?.[market]) : p.market === 'all' || (p.market ?? 'gold') === market));
 
+// A story the price then followed, by a real move within the hour, ranks above one that is only a call.
+const confirmedBy = (post, market) => (post.readings?.[market]?.after?.outcome === 'hit' ? 1 : 0);
+
 // The stories for one market. With a direction, only stories that fit that direction count,
 // so the answer never contradicts the move. Biggest first, with the newest breaking ties.
 function topStories(day, market = 'gold', limit = 3, direction = null) {
   const wanted = direction === 'up' ? 'bullish' : direction === 'down' ? 'bearish' : null;
   return (day?.posts ?? [])
     .filter((p) => p.type === 'news' && p.readings?.[market] && (!wanted || p.readings[market].verdict === wanted))
-    .sort((a, b) => (IMPORTANCE[b.readings[market].importance] ?? 0) - (IMPORTANCE[a.readings[market].importance] ?? 0)
+    .sort((a, b) => (confirmedBy(b, market) - confirmedBy(a, market))
+      || (IMPORTANCE[b.readings[market].importance] ?? 0) - (IMPORTANCE[a.readings[market].importance] ?? 0)
       || (b.sources?.length ?? 1) - (a.sources?.length ?? 1)
       || b.at.localeCompare(a.at))
     .slice(0, limit);
@@ -1569,7 +1656,7 @@ function localise(state, lang, text) {
 const langPath = (lang, path) => (lang === 'ar' ? (path === '/' ? '/ar' : `/ar${path}`) : path);
 
 // The pages that have an Arabic version. The rest open in English.
-const isArabicPath = (path) => /^\/(why-is-gold-moving-today|why-is-oil-moving-today|(gold|oil)-today(\/[\d-]*)?|gold-news-calendar|gold-calculator|gold-rate(\/[a-z-]*)?|gold-cheat-sheet|disclaimer|scorecard|weekly-recap|release-history|trading-calculator)?$/.test(path);
+const isArabicPath = (path) => /^\/(why-is-gold-moving-today|why-is-oil-moving-today|(gold|oil)-today(\/[\d-]*)?|gold-news-calendar|gold-calculator|gold-rate(\/[a-z-]*)?|gold-cheat-sheet|disclaimer|scorecard|weekly-recap|release-history|trading-calculator|technical-analysis)?$/.test(path);
 
 const MARKET_AR = {
   gold: { name: 'الذهب', forName: 'للذهب', short: 'الذهب', unit: 'أونصة', up: 'ارتفع', down: 'انخفض', flat: 'استقر', moving: 'يتحرك', moved: 'تحرك', ended: 'أنهى' },
@@ -2709,11 +2796,11 @@ function botReply(command, { state, config, now }) {
 // ---------- src-collector-index.js ----------
 __modules['src-collector-index.js'] = (() => {
 const { parseFeed } = __modules['src-collector-rss.js'];
-const { classify, extractActual, figureOf, isMacroHeadline, parseResult, sameStory, timingOf } = __modules['src-collector-classify.js'];
+const { classify, extractActual, figureOf, isMacroHeadline, parseResult, sameStory, timingOf, strictGate } = __modules['src-collector-classify.js'];
 const { aiAnswer, aiClassify, aiExplainMove, aiExplainStory, aiTranslate } = __modules['src-collector-ai.js'];
 const { normaliseCalendar, mergeCalendar, readingOf } = __modules['src-collector-calendar.js'];
 const { sendTelegram, sendTelegramPhoto, telegramReason, telegramSession, telegramText } = __modules['src-collector-telegram.js'];
-const { changes, MARKETS, MARKET_KEYS, migrateState, newDay, newState, normaliseDay, PEGGED_FX, priceOf, storyPool, topStories } = __modules['src-core-state.js'];
+const { changes, emptyScore, MARKETS, MARKET_KEYS, migrateState, newDay, newState, normaliseDay, PEGGED_FX, priceOf, storyPool, topStories } = __modules['src-core-state.js'];
 const { addSample, candlesFromSnapshots, dayBarFrom, levelsToWatch, MINUTE } = __modules['src-core-levels.js'];
 const { macroReading, newsMood } = __modules['src-core-insights.js'];
 const { moveChart } = __modules['src-lib-png.js'];
@@ -2742,6 +2829,10 @@ const HOUR = 36e5;
 const RANK = { high: 2, medium: 1 };
 const digitsFor = (market) => (market === 'oil' ? 2 : 0);
 const FLAT_MOVE = 0.02;
+// Since 13 Nov 2026 a verdict only counts as matched or missed when the price really moved in the hour:
+// at least 0.10% for gold or 0.25% for Brent. Smaller wiggles are noise, so they count as barely moved.
+const FLAT_BY = { gold: 0.1, oil: 0.25 };
+const SCORE_METHOD = 2;
 // Fast moves. Gold is checked every minute and compared with the past 10 minutes.
 const FAST_WINDOW = minutes(10);
 const FAST_PAUSE = minutes(15);
@@ -2753,6 +2844,10 @@ const BAD_QUOTE = 3; // A jump this big in percent between two checks has to sho
 const TRANSLATE_BATCH = 30;
 const TRANSLATE_DAILY = 600;
 const TRANSLATIONS_KEPT = 1200;
+// Analysts' views from other sites: only headlines about gold or oil, and only ones that read as analysis.
+const ANALYSIS_GOLD = /\b(gold|xau(\/?usd)?|bullion)\b/i;
+const ANALYSIS_OIL = /\b(oil|crude|brent|wti)\b/i;
+const ANALYSIS_WORDS = /\b(forecast|technical|analysis|outlook|prediction|levels?|support|resistance|chart|pattern|elliott|fibonacci|bulls?|bears?|bullish|bearish|targets?|breakout|breakdown|trend|wave|rsi|moving average|sma|ema|price action)\b/i;
 
 function howLong(ms) {
   const mins = Math.round(ms / 60000);
@@ -2939,6 +3034,7 @@ class Collector {
       await this.updateFx(now);
       await this.updateCalendar(now);
       await this.updateRates(now);
+      await this.updateAnalysis(now).catch((error) => this.log('analysis feeds failed', error.message));
       const { fresh, labelled } = await this.refreshNews(now, quiet);
       for (const market of MARKET_KEYS) {
         this.publishMove(market, now, quiet);
@@ -3604,12 +3700,53 @@ class Collector {
     }
   }
 
+  // Analysts' latest views on gold and Brent from other sites: the headline and a link, nothing more.
+  async updateAnalysis(now) {
+    const { state, config } = this;
+    const feeds = config.sources.analysis ?? [];
+    if (!feeds.length) return;
+    if (state.analysisAt && now - new Date(state.analysisAt) < minutes(30)) return;
+    state.analysisAt = now.toISOString();
+    const results = await Promise.allSettled(feeds.map(async (source) => {
+      const response = await this.#get(source.url, { timeout: 12000 });
+      if (!response.ok) throw new Error(`answered ${response.status}`);
+      return parseFeed(await response.text(), source.name);
+    }));
+    const kept = new Map((state.analysis ?? []).map((a) => [a.link, a]));
+    results.forEach((outcome, i) => {
+      const name = `Analysis: ${feeds[i].name}`;
+      if (outcome.status === 'rejected') { this.#mark(name, false, outcome.reason?.message); return; }
+      let added = 0;
+      for (const item of outcome.value) {
+        const market = ANALYSIS_GOLD.test(item.title) ? 'gold' : ANALYSIS_OIL.test(item.title) ? 'oil' : null;
+        if (!market || !item.link || kept.has(item.link)) continue;
+        if (feeds[i].onlyAnalysis && !ANALYSIS_WORDS.test(item.title)) continue;
+        const date = item.date instanceof Date && !Number.isNaN(item.date.getTime()) ? item.date : now;
+        kept.set(item.link, { t: (date > now ? now : date).toISOString(), title: item.title, link: item.link, source: item.source, market });
+        added++;
+      }
+      this.#mark(name, true, `${outcome.value.length} headlines, ${added} new on gold or oil`);
+    });
+    const cutoff = new Date(now.getTime() - 7 * 864e5).toISOString();
+    state.analysis = [...kept.values()].filter((a) => a.t >= cutoff).sort((a, b) => b.t.localeCompare(a.t)).slice(0, 80);
+    this.dirty = true;
+  }
+
   async updateCalendar(now) {
     const { state, config } = this;
     if (state.calendar.fetchedAt && now - new Date(state.calendar.fetchedAt) < HOUR) return;
     state.calendar.fetchedAt = now.toISOString();
     try {
-      const rows = await this.#json(config.sources.calendar);
+      // A copy refreshed every hour by GitHub comes first: the original feed often turns away shared servers like Render's.
+      let rows;
+      try {
+        if (!config.sources.calendarMirror) throw new Error('no mirror');
+        rows = await this.#json(config.sources.calendarMirror);
+        const newest = Math.max(0, ...(Array.isArray(rows) ? rows : []).map((r) => Date.parse(r.date) || 0));
+        if (newest < now.getTime() - 2 * 864e5) throw new Error('mirror out of date');
+      } catch {
+        rows = await this.#json(config.sources.calendar);
+      }
       const fresh = normaliseCalendar(rows);
       state.calendar.events = mergeCalendar(state.calendar.events, fresh, now);
       this.dirty = true;
@@ -3749,7 +3886,8 @@ class Collector {
         }
       }
     }
-    return items.map((item) => ({ item, label: labels.get(item) })).filter((row) => row.label);
+    // The strict filter has the last word, for the rules and for Claude alike.
+    return items.map((item) => ({ item, label: strictGate(item.title, labels.get(item)) })).filter((row) => row.label);
   }
 
   #priceAt(market, at, now) {
@@ -4005,6 +4143,14 @@ class Collector {
   // For each "right now" story, checks what the price did in the hour after it landed.
   scoreStories(now) {
     const { state } = this;
+    // The stricter filter and the noise threshold started on 13 Nov 2026, so the count starts again from then.
+    if (state.scoreMethod !== SCORE_METHOD) {
+      state.score = { gold: emptyScore(), oil: emptyScore() };
+      state.scoreLog = [];
+      state.scoreMethod = SCORE_METHOD;
+      state.scoreSince = now.toISOString();
+      this.dirty = true;
+    }
     const nearest = (market, target) => {
       const list = [...(state.previous?.snapshots?.[market] ?? []), ...(market === 'oil' ? state.today.oil.snapshots : state.today.snapshots)];
       let best = null;
@@ -4031,7 +4177,7 @@ class Collector {
         }
         const change = ((later - reading.price) / reading.price) * 100;
         const wanted = reading.verdict === 'bullish' ? 1 : -1;
-        const outcome = Math.abs(change) < FLAT_MOVE ? 'flat' : Math.sign(change) === wanted ? 'hit' : 'miss';
+        const outcome = Math.abs(change) < (FLAT_BY[market] ?? FLAT_MOVE) ? 'flat' : Math.sign(change) === wanted ? 'hit' : 'miss';
         reading.after = { pct: Math.round(change * 100) / 100, price: later, outcome };
         const score = state.score[market];
         score[outcome]++;
@@ -4607,6 +4753,7 @@ function newsCard(post, ctx, market, fmt) {
     <header class="post-top">
       ${stamp(reading.verdict)}<strong class="v-${reading.verdict}">${t(lang, reading.verdict, { market })}</strong>
       ${reading.importance === 'high' ? html`<span class="chip">${t(lang, 'highImpact')}</span>` : ''}
+      ${reading.after?.outcome === 'hit' ? html`<span class="chip" style="background:#1f7a4d;color:#fff">${lang === 'ar' ? 'أكّده السعر' : 'Confirmed by price'}</span>` : ''}
       <span class="post-time">${time(post.at, config, fmt, lang)}</span>
     </header>
     <h3 dir="auto">${localise(state, lang, post.title)}</h3>
@@ -5079,6 +5226,7 @@ const GROUPS = [
     ['/oil-today', 'Earlier days: Brent', 'Every day\'s stories, kept', 'الأيام السابقة: برنت', 'أخبار كل يوم محفوظة'],
   ] },
   { key: 'tools', en: 'Tools', ar: 'الأدوات', items: [
+    ['/technical-analysis', 'Technical analysis', 'Live gauges, charts and analyst views', 'التحليل الفني', 'مؤشرات ورسوم مباشرة وآراء المحللين'],
     ['/trading-calculator', 'Trading calculator', 'Lot size, and profit or loss', 'حاسبة التداول', 'حجم العقد، والربح أو الخسارة'],
     ['/gold-calculator', 'Gold value calculator', 'What your gold is worth', 'حاسبة قيمة الذهب', 'كم يساوي ذهبك'],
     ['/gold-rate', 'Gold rates by country', 'Per gram, tola and ounce', 'أسعار الذهب حسب الدولة', 'للغرام والتولة والأونصة'],
@@ -5866,8 +6014,8 @@ function archivePage({ state, config, market = 'gold', lang = 'en' }) {
 
 // ---------- src-views-tools.js ----------
 __modules['src-views-tools.js'] = (() => {
-// The release history page and the trading calculator.
-const { html } = __modules['src-lib-html.js'];
+// The release history page, the trading calculator and the technical analysis page.
+const { html, raw } = __modules['src-lib-html.js'];
 const { layout } = __modules['src-views-layout.js'];
 const { stamp, time } = __modules['src-views-components.js'];
 const { pct } = __modules['src-lib-format.js'];
@@ -5973,7 +6121,76 @@ function tradingPage({ state, config, lang = 'en' }) {
   </div>`;
   return layout({ config, state, lang, path: '/trading-calculator', active: '/trading-calculator', title: t(lang, 'tradeTitle'), description: t(lang, 'tradeMeta'), body });
 }
-  return { releasePage, tradingPage };
+// The technical analysis page: TradingView's live gauges and charts, which update by themselves,
+// and the latest analysts' views from other sites (headline and link only).
+const TV_SYMBOLS = { gold: 'OANDA:XAUUSD', oil: 'TVC:UKOIL' };
+const safeLink = (url) => (/^https?:\/\//i.test(url ?? '') ? url : null);
+
+function tvWidget(kind, settings, height) {
+  const json = JSON.stringify(settings).replace(/</g, '\\u003c');
+  return raw(`<div class="tradingview-widget-container" style="height:${height}px;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div><script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-${kind}.js" async>${json}</script></div>`);
+}
+
+const TA_TEXT = {
+  en: {
+    title: 'Technical analysis: gold and Brent',
+    meta: 'Live technical analysis for gold and Brent oil: buy and sell gauges, charts and the latest analysts’ views.',
+    lede: 'Live buy and sell gauges and charts from TradingView that update by themselves, plus the latest analysts’ views from other sites.',
+    gold: 'Gold (XAU/USD)',
+    oil: 'Brent crude',
+    gauge: 'Buy or sell gauge',
+    chart: 'Live chart',
+    views: 'Latest analysts’ views',
+    none: 'No new analysis yet. This list fills up within the hour.',
+    note: 'TradingView works out the gauge from common indicators such as moving averages, RSI and MACD. Pick 1m, 5m, 15m or 1h on the gauge to match how you trade. Analysts’ headlines open on their own sites. Education only, not financial advice.',
+  },
+  ar: {
+    title: 'التحليل الفني: الذهب وبرنت',
+    meta: 'تحليل فني مباشر للذهب وخام برنت: مؤشرات شراء وبيع ورسوم بيانية وأحدث آراء المحللين.',
+    lede: 'مؤشرات شراء وبيع ورسوم بيانية مباشرة من TradingView تتحدث تلقائياً، مع أحدث آراء المحللين من مواقع أخرى.',
+    gold: 'الذهب (XAU/USD)',
+    oil: 'خام برنت',
+    gauge: 'مؤشر الشراء أو البيع',
+    chart: 'رسم بياني مباشر',
+    views: 'أحدث آراء المحللين',
+    none: 'لا توجد تحليلات جديدة بعد. تمتلئ هذه القائمة خلال ساعة.',
+    note: 'يحسب TradingView المؤشر من مؤشرات شائعة مثل المتوسطات المتحركة وRSI وMACD. اختر دقيقة أو 5 دقائق أو 15 دقيقة أو ساعة حسب طريقة تداولك. تفتح عناوين المحللين على مواقعهم. للتعليم فقط، وليست نصيحة مالية.',
+  },
+};
+
+function analysisPage({ state, config, lang = 'en' }) {
+  const L = TA_TEXT[lang === 'ar' ? 'ar' : 'en'];
+  const locale = lang === 'ar' ? 'ar_AE' : 'en';
+  const block = (market) => {
+    const symbol = TV_SYMBOLS[market];
+    const items = (state.analysis ?? []).filter((a) => a.market === market).slice(0, 10);
+    return html`<section class="ta-market" id="ta-${market}">
+      <h2>${L[market]}</h2>
+      <div class="ta-grid" style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));align-items:start">
+        <div><h3>${L.gauge}</h3>${tvWidget('technical-analysis', { interval: '15m', width: '100%', isTransparent: true, height: '100%', symbol, showIntervalTabs: true, displayMode: 'single', locale, colorTheme: 'dark' }, 450)}</div>
+        <div><h3>${L.chart}</h3>${tvWidget('advanced-chart', { autosize: true, symbol, interval: '15', timezone: 'Asia/Dubai', theme: 'dark', style: '1', locale, backgroundColor: 'rgba(0, 0, 0, 0)', allow_symbol_change: false, calendar: false, hide_volume: true, support_host: 'https://www.tradingview.com' }, 450)}</div>
+      </div>
+      <h3>${L.views}</h3>
+      ${items.length ? html`<ul class="ta-list">${items.map((a) => {
+        const link = safeLink(a.link);
+        return html`<li>${link ? html`<a href="${link}" rel="noopener nofollow" target="_blank" dir="auto">${a.title}</a>` : html`<span dir="auto">${a.title}</span>`} <small class="note">${a.source}${lang === 'ar' ? '،' : ','} ${time(a.t, config, 'dhm', lang)}</small></li>`;
+      })}</ul>` : html`<p class="empty">${L.none}</p>`}
+    </section>`;
+  };
+  const body = html`
+  <section class="page-head"><div class="wrap">
+    <h1>${L.title}</h1>
+    <p class="lede">${L.lede}</p>
+  </div></section>
+  <div class="wrap">
+    ${block('gold')}
+    ${block('oil')}
+    <p class="note">${L.note}</p>
+  </div>`;
+  return layout({ config, state, lang, path: '/technical-analysis', active: '/technical-analysis', title: L.title, description: L.meta, body });
+}
+
+  return { releasePage, tradingPage, analysisPage };
 })();
 
 // ---------- src-views-pages.js ----------
@@ -6378,6 +6595,9 @@ function scorecardPage({ state, config, lang = 'en' }) {
   <section class="page-head"><div class="wrap">
     <h1>${t(lang, 'scoreTitle')}</h1>
     <p class="lede">${t(lang, 'scoreLede')}</p>
+    <p class="note">${lang === 'ar'
+      ? 'منذ 13 نوفمبر 2026 يستخدم الموقع فلتراً أشد بكثير للأخبار، ولا يُحسب الحكم صائباً أو خاطئاً إلا إذا تحرك السعر فعلاً خلال الساعة: 0.10% على الأقل للذهب أو 0.25% لبرنت. الحركة الأصغر تُعد «بالكاد تحرك». لذلك بدأ العد من جديد في ذلك اليوم.'
+      : 'Since 13 Nov 2026 the site uses a much stricter news filter, and a verdict only counts as matched or missed when the price really moved within the hour: at least 0.10% for gold or 0.25% for Brent. Smaller moves count as barely moved. The count started again on that day.'}</p>
   </div></section>
   <div class="wrap narrow">
     ${scoreBlock(state.score.gold, 'gold', lang)}
@@ -6536,7 +6756,7 @@ const { createStore } = __modules['src-store-index.js'];
 const { Collector } = __modules['src-collector-index.js'];
 const { buildIcs } = __modules['src-collector-calendar.js'];
 const { archivePage, dayPage, marketPage, todayFragment } = __modules['src-views-today.js'];
-const { releasePage, tradingPage } = __modules['src-views-tools.js'];
+const { analysisPage, releasePage, tradingPage } = __modules['src-views-tools.js'];
 const { aboutPage, calculatorPage, calendarPage, cheatSheetPage, countryPage, COUNTRIES, disclaimerPage, guidePage, guidesIndex, historyPage, marketHoursPage, marketsPage, notFoundPage, privacyPage, ratePage, scorecardPage, statusPage, termsPage, weeklyPage } = __modules['src-views-pages.js'];
 const { isValidDate } = __modules['src-lib-time.js'];
 const { GUIDES } = __modules['src-content-guides.js'];
@@ -6572,6 +6792,17 @@ function contentPolicy(config = {}) {
 
 const STRICT_POLICY = contentPolicy();
 
+// TradingView's widgets load one script and show in frames from TradingView's own sites.
+// Only the technical analysis page needs them, so only that page allows them.
+function withTradingView(policy) {
+  const add = (p, directive, sources) => (new RegExp(`(^|; )${directive} `).test(p)
+    ? p.replace(new RegExp(`((?:^|; )${directive} [^;]*)`), `$1 ${sources}`)
+    : `${p}; ${directive} ${sources}`);
+  let p = add(policy, 'script-src', 'https://s3.tradingview.com');
+  p = add(p, 'frame-src', 'https://s.tradingview.com https://www.tradingview-widget.com https://s3.tradingview.com https://www.tradingview.com');
+  return p;
+}
+
 function send(req, res, status, body, headers = {}) {
   const text = typeof body === 'string' || Buffer.isBuffer(body) ? body : String(body);
   const buffer = Buffer.isBuffer(text) ? text : Buffer.from(text);
@@ -6601,7 +6832,7 @@ function sitemap(config, state) {
   const base = config.siteUrl;
   const paths = [
     '/why-is-gold-moving-today', '/why-is-oil-moving-today', '/brent-oil-price-history', '/oil-today', '/gold-news-calendar', '/gold-calculator', '/gold-rate', '/markets', '/guides/', '/gold-today',
-    '/gold-price-history', '/gold-market-hours', '/gold-cheat-sheet', '/scorecard', '/weekly-recap', '/release-history', '/trading-calculator', '/about', '/disclaimer', '/privacy', '/terms',
+    '/gold-price-history', '/gold-market-hours', '/gold-cheat-sheet', '/scorecard', '/weekly-recap', '/release-history', '/trading-calculator', '/technical-analysis', '/about', '/disclaimer', '/privacy', '/terms',
     ...COUNTRIES.map((c) => `/gold-rate/${c.slug}`),
     ...GUIDES.map((g) => `/guides/${g.slug}`),
     ...state.days.slice(0, 400).flatMap((d) => [`/gold-today/${d.date}`, ...(d.oilTitle ? [`/oil-today/${d.date}`] : [])]),
@@ -6731,6 +6962,9 @@ function createApp({ config, collector, now = () => new Date() }) {
         case '/weekly-recap': return page(weeklyPage(ctx));
         case '/release-history': return page(releasePage(ctx));
         case '/trading-calculator': return page(tradingPage(ctx));
+        case '/technical-analysis':
+          req.csp = withTradingView(req.csp ?? contentPolicy(config));
+          return page(analysisPage(ctx));
         case '/manifest.webmanifest':
           return send(req, res, 200, manifest(config), { 'content-type': 'application/manifest+json; charset=utf-8', 'cache-control': 'public, max-age=86400' });
         case '/ads.txt':
