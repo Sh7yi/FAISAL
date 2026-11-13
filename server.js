@@ -595,9 +595,15 @@ class Engine {
     try {
       const text = await this.store.read('halal-state.json');
       if (text) this.state = { ...emptyState(), ...JSON.parse(text) };
-      this.net.mark('History storage', true, this.store.durable ? 'saving to GitHub' : 'temporary (wiped on restart)');
+      this.net.mark('History storage', true, this.store.durable ? 'saving to GitHub' : 'on the server (resets when the site restarts)');
     } catch (error) {
-      this.net.mark('History storage', false, error.message);
+      if (this.store.mode === 'github') {
+        const { FileStore } = require('./store');
+        this.store = new FileStore(this.config.dataDir);
+        this.net.mark('History storage', true, 'on the server (resets when the site restarts)');
+      } else {
+        this.net.mark('History storage', false, error.message);
+      }
     }
   }
 
@@ -609,8 +615,15 @@ class Engine {
       await this.store.write({ 'halal-state.json': JSON.stringify(this.state) });
       this.dirty = false;
       this.saveError = null;
-      this.net.mark('History storage', true, this.store.durable ? 'saving to GitHub' : 'temporary (wiped on restart)');
+      this.net.mark('History storage', true, this.store.durable ? 'saving to GitHub' : 'on the server (resets when the site restarts)');
     } catch (error) {
+      if (this.store.mode === 'github' && /answered (401|403|404)/.test(error.message)) {
+        // The owner chose not to use GitHub for saving: keep data on the server from now on.
+        const { FileStore } = require('./store');
+        this.store = new FileStore(this.config.dataDir);
+        this.lastSave = 0;
+        return this.save(true);
+      }
       this.saveError = error.message;
       this.net.mark('History storage', false, error.message);
     }
@@ -1083,7 +1096,6 @@ class Engine {
       { key: 'ALPACA_KEY_ID + ALPACA_SECRET_KEY', ok: alpaca.enabled(c), what: 'Real-time Benzinga news (free account).' },
       { key: 'ANTHROPIC_API_KEY', ok: Boolean(c.ai.key), what: 'Claude reads each headline.' },
       { key: 'TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID', ok: Boolean(c.telegram.token && c.telegram.chatId), what: 'Alerts on your phone.' },
-      { key: 'GITHUB_DATA_TOKEN', ok: this.store.durable && !this.saveError, what: 'Keeps signals and the scorecard after restarts.' },
     ];
   }
 
@@ -2832,7 +2844,7 @@ ${groups.map(([k, label]) => { const list = scored.filter((s) => first(s) === k)
 ${scored.slice(0, 80).map((s) => html`<tr><td><a href="/s/${encodeURIComponent(s.symbol)}"><b>${s.symbol}</b></a></td><td class="small">${dubaiTime(s.createdAt)}</td><td>${VERDICTS[first(s)]?.label}</td><td>${money(s.outcome.entry)}</td>
 <td>${isNum(s.outcome.d1) ? changeSpan(s.outcome.d1) : '–'}</td><td>${isNum(s.outcome.d5) ? changeSpan(s.outcome.d5) : '–'}</td><td>${isNum(s.outcome.d10) ? changeSpan(s.outcome.d10) : '–'}</td><td>${changeSpan(s.outcome.maxGain)}</td>
 <td>${s.outcome.hit20 ? html`<span class="chip g">Target</span>` : s.outcome.stopped ? html`<span class="chip r">Stopped</span>` : s.outcome.done ? html`<span class="chip">Neither</span>` : html`<span class="chip t">Running</span>`}</td></tr>`)}
-</table></div>` : html`<div class="empty">Results appear one trading day after the first signals.${engine.store.durable ? '' : ' Note: until GITHUB_DATA_TOKEN works, results are lost when the site restarts.'}</div>`}`;
+</table></div>` : html`<div class="empty">Results appear one trading day after the first signals.${engine.store.durable ? '' : ' Results are kept on the server and reset when the site restarts.'}</div>`}`;
   return layout({ title: 'Scorecard', active: '/scorecard', body, config, version: engine.version });
 }
 
