@@ -1129,6 +1129,20 @@ class Engine {
     } else {
       this.net.mark('News: Benzinga (Alpaca)', false, 'ALPACA_KEY_ID and ALPACA_SECRET_KEY are not set yet');
     }
+    // Every 10 minutes, and right after a restart: all of today's news for the penny stocks,
+    // so a scalp never misses news that came out before the site started.
+    this.pennyTick = (this.pennyTick ?? 0) + 1;
+    if (alpaca.enabled(this.config) && this.pennyTick % 10 === 1) {
+      const syms = this.pennyList();
+      if (syms.length) {
+        try {
+          const dayStart = new Date(now.getTime() - nyClock(now).minutes * MINUTE);
+          items.push(...(await alpaca.news(this.net, this.config, { start: dayStart, pages: 2, symbols: syms })));
+        } catch (error) {
+          this.net.mark('News: Benzinga (Alpaca)', false, `penny news: ${error.message}`);
+        }
+      }
+    }
     this.wireTick = (this.wireTick ?? 0) + 1;
     if (!alpaca.enabled(this.config) || this.wireTick % 2 === 1) items.push(...(await fetchWires(this.net)));
     s.lastNewsAt = now.toISOString();
@@ -2373,12 +2387,13 @@ function headers(config) {
 const enabled = (config) => Boolean(config.alpaca.keyId && config.alpaca.secret);
 
 // Newest news since `start`, newest first.
-async function news(net, config, { start, pages = 3 } = {}) {
+async function news(net, config, { start, pages = 3, symbols = null } = {}) {
   const items = [];
   let token = '';
   for (let page = 0; page < pages; page++) {
     const params = new URLSearchParams({ limit: '50', sort: 'desc', include_content: 'false' });
     if (start) params.set('start', new Date(start).toISOString());
+    if (symbols?.length) params.set('symbols', symbols.join(','));
     if (token) params.set('page_token', token);
     const body = await net.json(`${config.alpaca.dataUrl}/v1beta1/news?${params}`, { headers: headers(config), timeout: 15000, ua: 'halal-swing-site' });
     for (const n of body?.news ?? []) {
