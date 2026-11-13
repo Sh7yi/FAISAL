@@ -97,16 +97,9 @@ const DATA_SOURCES = {
       "url": "https://www.investing.com/rss/commodities.rss"
     },
     {
-      "name": "Investing.com Technical Analysis",
-      "url": "https://www.investing.com/rss/commodities_Technical.rss"
-    },
-    {
-      "name": "Investing.com Fundamental Analysis",
-      "url": "https://www.investing.com/rss/commodities_Fundamental.rss"
-    },
-    {
-      "name": "Investing.com Market Technicals",
-      "url": "https://www.investing.com/rss/market_overview_Technical.rss"
+      "name": "investingLive Commodities",
+      "url": "https://investinglive.com/feed/commodities",
+      "onlyAnalysis": true
     }
   ],
   "fx": "https://open.er-api.com/v6/latest/USD",
