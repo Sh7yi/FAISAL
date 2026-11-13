@@ -430,6 +430,102 @@ module.exports = { decide, tenPoint, buildLevels, VERDICTS, daysUntil };
 
 };
 
+// ---------- analysis/scalp.js ----------
+__defs["analysis/scalp"] = (module, exports, require) => {
+// Penny-stock scalping: minutes to a few hours, on the 1-minute chart.
+// What we look for, the way momentum scalpers do: fresh news, a big % move,
+// heavy volume vs normal, a small float, price above VWAP and pushing the high
+// of the day with a fresh burst of volume — early in the session.
+const { money, pct, compact, isNum, nyClock } = require('../lib/util');
+
+function vwapOf(candles, from) {
+  let pv = 0; let v = 0; const series = [];
+  for (const c of candles) {
+    if (c.t < from) { series.push(null); continue; }
+    const vol = c.v || 0;
+    pv += ((c.h + c.l + c.c) / 3) * vol; v += vol;
+    series.push(v ? pv / v : null);
+  }
+  return { vwap: v ? pv / v : null, series };
+}
+
+function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = new Date(), config }) {
+  const sc = config.scalp;
+  const candles = intra?.candles ?? [];
+  const price = intra?.price ?? candles[candles.length - 1]?.c ?? null;
+  const prev = intra?.prevClose ?? null;
+  const start = intra?.regularStart ?? null;
+  const regular = start ? candles.filter((c) => c.t >= start) : [];
+  const pre = start ? candles.filter((c) => c.t < start) : candles;
+  const { vwap, series } = vwapOf(candles, start ?? 0);
+  const preHigh = pre.length ? Math.max(...pre.map((c) => c.h)) : null;
+  const hod = regular.length ? Math.max(...regular.map((c) => c.h)) : preHigh;
+  const change = price && prev ? price / prev - 1 : null;
+  const volume = intra?.volume ?? regular.reduce((s, c) => s + (c.v || 0), 0);
+  const minutesIn = state === 'open' ? Math.max(1, nyClock(now).minutes - (9 * 60 + 30)) : 0;
+  const expected = state === 'open' ? Math.min(1, Math.max(0.12, (minutesIn / 390) ** 0.7)) : 1;
+  const rvol = avgVol && volume ? volume / (avgVol * expected) : null;
+  const last5 = regular.slice(-5); const perMin = regular.length ? regular.reduce((s, c) => s + (c.v || 0), 0) / regular.length : 0;
+  const surge = perMin && last5.length ? last5.reduce((s, c) => s + (c.v || 0), 0) / last5.length / perMin : null;
+  const recentLow = last5.length ? Math.min(...last5.map((c) => c.l)) : null;
+  const aboveVwap = vwap && price ? price / vwap - 1 : null;
+  const prime = state === 'open' && minutesIn <= sc.primeMinutes;
+  const goodNews = (news ?? []).find((n) => n.cls?.good && n.cls.impact >= 6) ?? null;
+
+  const items = [];
+  const add = (key, title, ok, note) => items.push({ key, title, status: ok === null ? 'na' : ok ? 'pass' : 'fail', note });
+  add('news', 'Fresh good news today', Boolean(goodNews), goodNews ? `${goodNews.title.slice(0, 90)} (${goodNews.cls.impact}/10)` : 'No good news found today — no news, no trade.');
+  add('price', `Penny price (${money(sc.minPrice)}–${money(sc.maxPrice)})`, isNum(price) ? price >= sc.minPrice && price <= sc.maxPrice : null, isNum(price) ? `${money(price)}${price < 1 ? ' — under $1: wider spreads, delisting risk' : ''}` : '');
+  add('move', `Up ${Math.round(sc.minUp * 100)}%+ today`, isNum(change) ? change >= sc.minUp : null, isNum(change) ? `${pct(change)} vs yesterday's close` : '');
+  add('rvol', `Volume ${sc.rvol}× normal`, isNum(rvol) ? rvol >= sc.rvol : null, isNum(rvol) ? `${rvol.toFixed(1)}× a normal day (projected)` : 'Not enough volume history.');
+  add('liquid', `${compact(sc.minVolume)}+ shares traded`, volume ? volume >= sc.minVolume * Math.min(1, expected * 2) : null, `${compact(volume)} shares today — enough to get in and out quickly`);
+  add('float', `Float under ${compact(sc.floatMax)}`, isNum(floatShares) ? floatShares < sc.floatMax : null, isNum(floatShares) ? `About ${compact(floatShares)} shares` : 'Float not found.');
+  add('vwap', 'Above VWAP', isNum(aboveVwap) ? aboveVwap > 0 : null, isNum(aboveVwap) ? `VWAP ${money(vwap)} (${pct(aboveVwap)} away) — buyers are in control above it` : 'VWAP starts at the open.');
+  add('hod', 'At the high of day', isNum(hod) && isNum(price) ? price >= hod * 0.97 : null, isNum(hod) ? `High of day ${money(hod)}${preHigh ? `, pre-market high ${money(preHigh)}` : ''}` : '');
+  add('surge', 'Fresh volume burst', isNum(surge) ? surge >= 1.5 : null, isNum(surge) ? `Last 5 minutes ${surge.toFixed(1)}× the day's average per minute` : '');
+  add('clean', 'No new shares being sold', dilution ? dilution.level !== 'recent' : null, dilution ? (dilution.level === 'recent' ? `${dilution.form} filed ${dilution.date} — they may sell into the spike` : dilution.level === 'shelf' ? `Shelf (${dilution.form}) on file — watch for an offering` : 'No recent offering') : 'Filings not checked.');
+  const score = items.filter((i) => i.status === 'pass').length;
+
+  let kind; let reason;
+  const ok = (key) => items.find((i) => i.key === key)?.status === 'pass';
+  if (dilution?.level === 'recent') { kind = 'AVOID'; reason = 'Recent share sale filed — penny stocks often sell new shares into a spike.'; }
+  else if (isNum(change) && change < 0) { kind = 'AVOID'; reason = 'Down on the day — scalps work on the strongest stocks, not the weakest.'; }
+  else if (state !== 'open') {
+    kind = 'WATCH';
+    reason = state === 'pre'
+      ? `Pre-market. XTB real shares trade from the 9:30 New York open. Plan: buy only if it breaks the pre-market high ${preHigh ? money(preHigh) : ''} with volume after the open.`
+      : 'Market closed. Scalps happen during the session.';
+  } else if (!goodNews) { kind = 'WATCH'; reason = 'Moving, but no news found today — no news, no trade.'; }
+  else if (isNum(aboveVwap) && aboveVwap < -0.02) { kind = 'AVOID'; reason = `Below VWAP ${money(vwap)} — sellers are in control right now.`; }
+  else if (isNum(aboveVwap) && aboveVwap > sc.maxAboveVwap) { kind = 'WAIT_PULLBACK'; reason = `Stretched ${pct(aboveVwap)} above VWAP — chasing is risky. Wait for a dip toward ${money(vwap)} that holds.`; }
+  // Within 1% of the high counts as at the high: on a $1 stock that is a single cent.
+  else if (isNum(hod) && price < hod * 0.99) {
+    kind = price >= hod * 0.97 ? 'WAIT_BREAKOUT' : 'WATCH';
+    reason = kind === 'WAIT_BREAKOUT' ? `Just under the high of day ${money(hod)}. Buy only on a break above ${money(hod * 1.003)} with a volume burst.` : `Pulled back from the high ${money(hod)}. Wait for it to curl back up above VWAP with volume.`;
+  } else if (!ok('rvol') || !ok('move') || !ok('surge')) {
+    kind = 'WATCH';
+    reason = !ok('move') ? 'Not up enough today to be a real runner.' : !ok('rvol') ? 'Volume is not heavy enough yet.' : 'At the high, but no fresh burst of volume — breakouts without volume fail.';
+  } else {
+    kind = 'BUY_NOW';
+    reason = `Breaking the high of day ${money(hod)} on a volume burst, above VWAP, with news.${prime ? '' : ' Note: later in the day breakouts fail more often.'}`;
+  }
+
+  // Tight scalp plan: stop under VWAP or the last 5-minute low (max 6%), sell half +5%, rest +10%.
+  let entry = price;
+  if (kind === 'WAIT_BREAKOUT' && hod) entry = hod * 1.003;
+  if (kind === 'WAIT_PULLBACK' && vwap) entry = vwap * 1.01;
+  if (state === 'pre' && preHigh) entry = preHigh * 1.003;
+  let stop = Math.max(entry * (1 - sc.maxStop), Math.min(vwap ? vwap * 0.99 : entry * 0.95, recentLow ? recentLow * 0.995 : entry * 0.95));
+  if (!(stop < entry * 0.985)) stop = entry * 0.97;
+  const levels = isNum(entry) ? { entry, stop, target1: entry * (1 + sc.t1), target2: entry * (1 + sc.t2), riskPct: 1 - stop / entry, rr: (sc.t2) / (1 - stop / entry) } : null;
+  const alert = kind === 'BUY_NOW' && (score >= sc.alertScore + (prime ? 0 : 1));
+  return { kind, reason, items, score, levels, vwap, vwapSeries: series, hod, preHigh, change, volume, rvol, surge, aboveVwap, prime, price, news: goodNews, alert };
+}
+
+module.exports = { scalpCheck, vwapOf };
+
+};
+
 // ---------- analysis/ta.js ----------
 __defs["analysis/ta"] = (module, exports, require) => {
 // Chart maths: moving averages, RSI, ATR, volume, and support / resistance zones.
@@ -633,6 +729,20 @@ function loadConfig(env = process.env) {
     rvolRush: num(env.RVOL_RUSH, 3),
     insiderMin: num(env.INSIDER_MIN_USD, 100000),
     moverMin: num(env.MOVER_MIN, 0.08),
+    scalp: {
+      minPrice: num(env.SCALP_MIN_PRICE, 0.1),
+      maxPrice: num(env.SCALP_MAX_PRICE, 5),
+      minUp: num(env.SCALP_MIN_UP, 0.1),
+      rvol: num(env.SCALP_RVOL, 5),
+      minVolume: num(env.SCALP_MIN_VOLUME, 1e6),
+      floatMax: num(env.SCALP_FLOAT_MAX, 20e6),
+      primeMinutes: num(env.SCALP_PRIME_MINUTES, 120),
+      maxAboveVwap: num(env.SCALP_MAX_ABOVE_VWAP, 0.12),
+      maxStop: num(env.SCALP_MAX_STOP, 0.06),
+      t1: num(env.SCALP_TARGET1, 0.05),
+      t2: num(env.SCALP_TARGET2, 0.1),
+      alertScore: num(env.SCALP_ALERT_SCORE, 8),
+    },
     minImpact: num(env.MIN_IMPACT, 7),
     targetGain: num(env.TARGET_GAIN, 0.2),
     newsSeconds: num(env.NEWS_SECONDS, 60),
@@ -697,7 +807,8 @@ const { analyze, sma } = require('./analysis/ta');
 const { decide, VERDICTS } = require('./analysis/plan');
 const { explodeCheck } = require('./analysis/explode');
 const { explain } = require('./analysis/explain');
-const { alertText, sendTelegram } = require('./telegram');
+const { scalpCheck } = require('./analysis/scalp');
+const { alertText, scalpAlertText, sendTelegram } = require('./telegram');
 const { MINUTE, HOUR, DAY, sleep, marketState, dayKey, nyClock, isWeekday, money, pct, compact, openInDubai } = require('./lib/util');
 
 const SECTOR_ETFS = ['XBI', 'XLK', 'SMH', 'XLV', 'XLE', 'XLB', 'XLY', 'XLI', 'XLC', 'XLU', 'XLP', 'ITA'];
@@ -721,6 +832,7 @@ function emptyState() {
     alpacaSince: null,
     stats: { newsToday: 0, newsDay: null, relevantToday: 0 },
     movers: { day: null, list: [] },
+    scalp: { day: null, updatedAt: null, rows: [], alerts: [] },
     trades: [],
     briefDay: null,
   };
@@ -808,6 +920,7 @@ class Engine {
     loop(() => this.save(), MINUTE, 'save');
     loop(() => this.fastChecks(), 5 * MINUTE, 'fast');
     loop(() => this.pollInsiders(), 10 * MINUTE, 'insiders');
+    loop(() => this.scanScalps(), MINUTE, 'scalp');
   }
 
   stop() { this.timers.forEach(clearInterval); this.timers = []; }
@@ -1354,6 +1467,99 @@ class Engine {
     } catch (error) {
       this.net.mark('Telegram alerts', false, error.message);
       return { ok: false, message: error.message };
+    }
+  }
+
+  // ---------- penny scalping, every minute ----------
+  pennyList() {
+    const { minPrice, maxPrice } = this.config.scalp;
+    return this.state.universe.symbols.filter((sym) => {
+      const p = this.quotes.get(sym)?.quote?.price ?? this.state.prices.map[sym]?.price;
+      return typeof p === 'number' && p >= minPrice && p <= maxPrice;
+    });
+  }
+
+  async scanScalps(now = new Date()) {
+    const s = this.state;
+    if (!s.scalp) s.scalp = { day: null, updatedAt: null, rows: [], alerts: [] };
+    const st = marketState(now);
+    const today = dayKey(now);
+    if (st === 'post' || st === 'closed') { await this.scoreScalps(now); return; }
+    if (!isWeekday(now)) return;
+    if (s.scalp.day !== today) s.scalp = { ...s.scalp, day: today, rows: [] };
+    const list = this.pennyList().slice(0, 40);
+    const rows = [];
+    for (const sym of list) {
+      try {
+        const intra = await this.intraday(sym, now);
+        if (!intra?.candles?.length) continue;
+        const daily = await this.getQuote(sym, 6 * HOUR);
+        const hist = (daily?.candles ?? []).filter((c) => dayKey(c.t) < today).slice(-30).map((c) => c.v).filter((v) => v > 0);
+        const avgVol = hist.length ? hist.reduce((a, b) => a + b, 0) / hist.length : null;
+        const info = await this.companyInfo(sym);
+        const fl = info.fund ? explodeCheck({ cls: { impact: 0, horizon: 'days' }, ta: null, fund: info.fund, dilution: null, market: null, sector: null, levels: null, candles: daily?.candles, config: this.config }).floatShares : null;
+        const news = s.news.filter((n) => n.symbol === sym && dayKey(n.time) === today);
+        const check = scalpCheck({ intra, avgVol, floatShares: fl, dilution: info.dilution, news, state: st, now, config: this.config });
+        const { vwapSeries, ...keep } = check;
+        rows.push({ symbol: sym, name: intra.name, ...keep, at: now.toISOString() });
+        if (check.alert && !s.scalp.alerts.some((a) => a.symbol === sym && a.day === today)) {
+          const alert = { id: hash(`${sym}|${today}|scalp`), symbol: sym, day: today, at: now.toISOString(), price: check.price, levels: check.levels, score: check.score, reason: check.reason, news: check.news?.title ?? '', result: null };
+          s.scalp.alerts.unshift(alert);
+          s.scalp.alerts = s.scalp.alerts.slice(0, 300);
+          this.dirty = true;
+          try {
+            await sendTelegram(this.net, this.config, scalpAlertText({ symbol: sym, name: intra.name, ...check }, this.config));
+            this.net.mark('Telegram alerts', true, `scalp: ${sym}`);
+          } catch (error) {
+            this.net.mark('Telegram alerts', false, error.message);
+          }
+        }
+      } catch (error) {
+        this.net.mark('Penny scalps (1-minute data)', false, `${sym}: ${error.message}`);
+      }
+      await sleep(150);
+    }
+    const order = { BUY_NOW: 0, WAIT_BREAKOUT: 1, WAIT_PULLBACK: 2, WATCH: 3, AVOID: 4 };
+    rows.sort((a, b) => (order[a.kind] - order[b.kind]) || (b.score - a.score) || ((b.change ?? -9) - (a.change ?? -9)));
+    s.scalp.rows = rows;
+    s.scalp.updatedAt = now.toISOString();
+    if (rows.length) this.net.mark('Penny scalps (1-minute data)', true, `${rows.length} penny stocks checked`);
+    this.scalpVersion = (this.scalpVersion ?? 0) + 1;
+  }
+
+  async intraday(sym, now = new Date()) {
+    this.intra = this.intra ?? new Map();
+    const cached = this.intra.get(sym);
+    if (cached && now - cached.at < 50 * 1000) return cached.data;
+    const data = await yahoo.intraday(this.net, sym);
+    this.intra.set(sym, { data, at: now.getTime() });
+    return data;
+  }
+
+  // After the close: did each scalp alert reach +5% / +10% before its stop?
+  async scoreScalps(now = new Date()) {
+    const s = this.state;
+    for (const a of (s.scalp?.alerts ?? []).filter((x) => !x.result && x.levels)) {
+      if (dayKey(a.at) !== dayKey(now) && now - Date.parse(a.at) > 3 * DAY) { a.result = { outcome: 'unknown' }; continue; }
+      if (dayKey(a.at) !== dayKey(now)) continue;
+      try {
+        const intra = await yahoo.intraday(this.net, a.symbol);
+        const after = intra.candles.filter((c) => c.t >= Date.parse(a.at) && (!intra.regularEnd || c.t < intra.regularEnd));
+        if (!after.length) continue;
+        let outcome = 'neither'; let half = false;
+        for (const c of after) {
+          if (!half && c.l <= a.levels.stop) { outcome = 'stopped'; break; }
+          if (!half && c.h >= a.levels.target1) half = true;
+          if (half && c.h >= a.levels.target2) { outcome = 'both'; break; }
+          if (half && c.l <= a.levels.entry) { outcome = 'half'; break; }
+        }
+        if (outcome === 'neither' && half) outcome = 'half';
+        a.result = { outcome, maxGain: Math.max(...after.map((c) => c.h)) / a.levels.entry - 1, close: after[after.length - 1].c / a.levels.entry - 1 };
+        this.touch();
+      } catch {
+        // try again on the next pass
+      }
+      await sleep(200);
     }
   }
 
@@ -2103,6 +2309,7 @@ function createServer(engine) {
       }
       if (path === '/news') return send(res, 200, String(pages.newsPage({ engine })));
       if (path === '/guide') return send(res, 200, String(pages.guidePage({ engine })));
+      if (path === '/penny') return send(res, 200, String(pages.pennyPage({ engine, part: url.searchParams.get('part') === '1' })));
       if (path === '/trades' && req.method === 'GET') return send(res, 200, String(pages.tradesPage({ engine, error: url.searchParams.get('e') ?? '' })));
       if (path.startsWith('/trades/') && req.method === 'POST') {
         // Only accept forms sent from this site.
@@ -2627,7 +2834,36 @@ async function spark(net, symbols) {
   return out;
 }
 
-module.exports = { chart, spark, toCandles };
+// Today's 1-minute candles, pre-market included, for scalping.
+async function intraday(net, symbol) {
+  const url = `${BASE}/v8/finance/chart/${encodeURIComponent(ySym(symbol))}?range=1d&interval=1m&includePrePost=true`;
+  const body = await net.json(url, { timeout: 15000 });
+  const result = body?.chart?.result?.[0];
+  if (!result) throw new Error(body?.chart?.error?.description || 'no intraday data');
+  const meta = result.meta ?? {};
+  const t = result.timestamp ?? [];
+  const q = result.indicators?.quote?.[0] ?? {};
+  const candles = [];
+  for (let i = 0; i < t.length; i++) {
+    const o = q.open?.[i]; const h = q.high?.[i]; const l = q.low?.[i]; const c = q.close?.[i];
+    if (![o, h, l, c].every((x) => typeof x === 'number' && Number.isFinite(x))) continue;
+    candles.push({ t: t[i] * 1000, o, h, l, c, v: q.volume?.[i] ?? 0 });
+  }
+  const reg = meta.currentTradingPeriod?.regular ?? {};
+  return {
+    symbol,
+    name: meta.longName || meta.shortName || symbol,
+    price: meta.regularMarketPrice ?? candles[candles.length - 1]?.c ?? null,
+    last: candles[candles.length - 1]?.c ?? null,
+    volume: meta.regularMarketVolume ?? 0,
+    prevClose: meta.previousClose ?? meta.chartPreviousClose ?? null,
+    regularStart: reg.start ? reg.start * 1000 : null,
+    regularEnd: reg.end ? reg.end * 1000 : null,
+    candles,
+  };
+}
+
+module.exports = { chart, spark, intraday, toCandles };
 
 };
 
@@ -2852,7 +3088,23 @@ async function sendTelegram(net, config, text) {
   return true;
 }
 
-module.exports = { alertText, sendTelegram };
+function scalpAlertText(x, config) {
+  const l = x.levels;
+  return [
+    `⚡ SCALP BUY NOW — $${x.symbol} ${money(x.price)} (${pct(x.change)})`,
+    x.name ?? '',
+    `Score ${x.score}/10${x.prime ? ' · prime time (first 2 hours)' : ''}`,
+    x.news ? `📰 ${x.news.title}` : '',
+    `📈 Above VWAP ${money(x.vwap)} · high of day ${money(x.hod)} · volume ${x.rvol ? x.rvol.toFixed(1) : '?'}× normal`,
+    l ? `🎯 Entry ${money(l.entry)} · Stop ${money(l.stop)} (${pct(-l.riskPct)})` : '',
+    l ? `💰 Sell half ${money(l.target1)} (+${Math.round(config.scalp.t1 * 100)}%) · rest ${money(l.target2)} (+${Math.round(config.scalp.t2 * 100)}%)` : '',
+    '⏱ Scalp: watch it closely. Exit if it loses VWAP or the stop.',
+    '✅ Halal (Zoya) · Real shares on XTB',
+    `${config.siteUrl}/penny`,
+  ].filter(Boolean).join('\n');
+}
+
+module.exports = { alertText, scalpAlertText, sendTelegram };
 
 };
 
@@ -3015,9 +3267,26 @@ form.addtrade input{flex:1 1 140px;padding:12px 16px;border-radius:999px;border:
 .mover:hover{text-decoration:none;border-color:#1d5a3c}
 .guide{display:grid;gap:12px} .guide p{margin:6px 0} .guide ul{padding-left:18px}
 nav.tabs{mask-image:linear-gradient(90deg,#000 85%,transparent)}
+.chart .vwap{fill:none;stroke:#c084fc;stroke-width:1.8}
+.chart .l-hod{stroke:#f5b83d;fill:#f5b83d}
+.chart .pre-zone{fill:rgba(255,255,255,.035)}
+details.bubble summary{cursor:pointer}
 `;
 
 const JS = `
+(function(){
+  if(document.body.getAttribute('data-live')==='penny'){
+    var box=document.getElementById('scalp-live');
+    setInterval(function(){
+      if(document.hidden||!box)return;
+      var open=[].map.call(box.querySelectorAll('details[open]'),function(d){return d.closest('article')&&d.closest('article').querySelector('.tick').textContent;});
+      fetch('/penny?part=1',{cache:'no-store'}).then(function(r){return r.ok?r.text():null}).then(function(t){
+        if(!t)return; box.innerHTML=t;
+        [].forEach.call(box.querySelectorAll('article'),function(a){var s=a.querySelector('.tick');if(s&&open.indexOf(s.textContent)>=0){var d=a.querySelector('details');if(d)d.open=true;}});
+      }).catch(function(){});
+    },30000);
+  }
+})();
 (function(){
   var pill=document.getElementById('newpill');
   var v=document.body.getAttribute('data-v');
@@ -3124,7 +3393,52 @@ function chartSvg({ candles = [], ta = null, levels = null, days = 90, height = 
   return raw(`<svg class="chart${compact ? ' chart-sm' : ''}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${label}" id="${id}">${parts.join('')}</svg>`);
 }
 
-module.exports = { chartSvg };
+// 1-minute chart for scalping: pre-market shaded, VWAP line, high of day and the plan.
+function intradaySvg({ candles = [], vwapSeries = [], regularStart = null, hod = null, levels = null, height = 260, id = 'i' } = {}) {
+  const keep = 150;
+  const offset = Math.max(0, candles.length - keep);
+  const data = candles.slice(offset);
+  if (data.length < 5) return raw('<div class="chart-empty">Waiting for today\'s trading…</div>');
+  const W = 640; const H = height; const padL = 6; const padR = 70; const padT = 10; const volH = 34;
+  const priceH = H - padT - volH - 10;
+  const lines = [];
+  if (levels) {
+    lines.push({ y: levels.target2, cls: 'l-target', label: '+10%' });
+    lines.push({ y: levels.target1, cls: 'l-target', label: '+5%' });
+    lines.push({ y: levels.entry, cls: 'l-entry', label: 'Entry' });
+    lines.push({ y: levels.stop, cls: 'l-stop', label: 'Stop' });
+  }
+  if (hod) lines.push({ y: hod, cls: 'l-hod', label: 'HOD' });
+  let lo = Math.min(...data.map((c) => c.l)); let hi = Math.max(...data.map((c) => c.h));
+  for (const l of lines) { lo = Math.min(lo, l.y); hi = Math.max(hi, l.y); }
+  const pad = (hi - lo) * 0.06 || hi * 0.02; lo -= pad; hi += pad;
+  const y = (p) => padT + (1 - (p - lo) / (hi - lo)) * priceH;
+  const step = (W - padL - padR) / data.length; const bw = Math.max(1.2, step * 0.65);
+  const x = (i) => padL + i * step + step / 2;
+  const parts = [];
+  const firstReg = regularStart ? data.findIndex((c) => c.t >= regularStart) : -1;
+  const preEnd = firstReg === -1 ? (regularStart && data[data.length - 1].t < regularStart ? data.length : 0) : firstReg;
+  if (preEnd > 0) parts.push(`<rect class="pre-zone" x="${padL}" y="${padT}" width="${fmt(preEnd * step)}" height="${fmt(priceH)}"/><text class="zone-t" x="${padL + 4}" y="${padT + 12}" fill="#8ea79b">pre-market</text>`);
+  const maxV = Math.max(...data.map((c) => c.v || 0)) || 1;
+  data.forEach((c, i) => {
+    const cls = c.c >= c.o ? 'up' : 'dn';
+    parts.push(`<line class="wick ${cls}" x1="${fmt(x(i))}" x2="${fmt(x(i))}" y1="${fmt(y(c.h))}" y2="${fmt(y(c.l))}"/>`);
+    parts.push(`<rect class="body ${cls}" x="${fmt(x(i) - bw / 2)}" y="${fmt(y(Math.max(c.o, c.c)))}" width="${fmt(bw)}" height="${fmt(Math.max(1, Math.abs(y(c.o) - y(c.c))))}"/>`);
+    const vh = ((c.v || 0) / maxV) * (volH - 4);
+    parts.push(`<rect class="vol ${cls}" x="${fmt(x(i) - bw / 2)}" y="${fmt(H - 10 - vh)}" width="${fmt(bw)}" height="${fmt(vh)}"/>`);
+  });
+  let d = '';
+  for (let i = 0; i < data.length; i++) { const v = vwapSeries[offset + i]; if (v == null) continue; d += `${d ? 'L' : 'M'}${fmt(x(i))},${fmt(y(v))}`; }
+  if (d) parts.push(`<path class="vwap" d="${d}"/>`);
+  for (const l of lines) {
+    if (!(l.y > lo && l.y < hi)) continue;
+    parts.push(`<line class="plan ${l.cls}" x1="${padL}" x2="${W - padR}" y1="${fmt(y(l.y))}" y2="${fmt(y(l.y))}"/>`);
+    parts.push(`<text class="plan-t ${l.cls}" x="${W - padR + 4}" y="${fmt(y(l.y) + 4)}">${l.label} ${money(l.y)}</text>`);
+  }
+  return raw(`<svg class="chart chart-intra" viewBox="0 0 ${W} ${H}" role="img" aria-label="Today's 1-minute chart" id="${id}">${parts.join('')}</svg>`);
+}
+
+module.exports = { chartSvg, intradaySvg };
 
 };
 
@@ -3135,10 +3449,12 @@ const { html, raw, safeUrl } = require('../lib/html');
 const { money, pct, compact, timeAgo, dubaiTime, isNum, marketState, openInDubai } = require('../lib/util');
 const { VERDICTS } = require('../analysis/plan');
 const { CATALYSTS } = require('../rules');
-const { chartSvg } = require('./chart');
+const { chartSvg, intradaySvg } = require('./chart');
+const { vwapOf } = require('../analysis/scalp');
 
 const NAV = [
   ['/', 'Signals'],
+  ['/penny', 'Penny scalps'],
   ['/news', 'All news'],
   ['/watchlist', 'Halal list'],
   ['/trades', 'My trades'],
@@ -3146,7 +3462,7 @@ const NAV = [
   ['/guide', 'How it works'],
   ['/status', 'Status'],
 ];
-function layout({ title, active = '/', body, config, version = '' }) {
+function layout({ title, active = '/', body, config, version = '', live = '' }) {
   return html`<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -3155,7 +3471,7 @@ function layout({ title, active = '/', body, config, version = '' }) {
 <title>${title} · ${config.siteName}</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css?v=${config.assetVersion}">
-</head><body data-v="${version}">
+</head><body data-v="${version}" data-live="${live}">
 <header class="top"><div class="wrap">
 <a class="brand" href="/"><span class="logo">☪</span><span>${config.siteName}</span></a>
 <nav class="tabs">${NAV.map(([href, label]) => html`<a href="${href}" class="${href === active ? 'on' : ''}">${label}</a>`)}</nav>
@@ -3562,7 +3878,76 @@ function notFoundPage({ engine, symbol }) {
   return layout({ title: 'Not found', active: '', body, config: engine.config, version: engine.version });
 }
 
-module.exports = { layout, loginPage, homePage, newsPage, stockPage, watchlistPage, scorecardPage, statusPage, notFoundPage, tradesPage, guidePage };
+function scalpCards(engine) {
+  const { state, config } = engine;
+  const sc = state.scalp ?? { rows: [] };
+  const ms = marketState();
+  if (!sc.rows?.length) {
+    return html`<div class="empty">${engine.pennyList().length ? (ms === 'closed' || ms === 'post' ? 'Market closed — the penny scanner runs from 4:00 to 16:00 New York time (pre-market included).' : 'Scanning… the first results appear within a minute.') : 'No halal penny stocks on your XTB list right now.'}</div>`;
+  }
+  const active = sc.rows.filter((r) => ['BUY_NOW', 'WAIT_BREAKOUT', 'WAIT_PULLBACK'].includes(r.kind) || (r.kind === 'WATCH' && r.change >= config.scalp.minUp));
+  const quiet = sc.rows.filter((r) => !active.includes(r));
+  const quietList = quiet.length ? html`<h3 style="margin-top:18px">Not in play right now</h3>${quiet.map((r) => html`<div class="news-row"><a class="chip" href="/s/${encodeURIComponent(r.symbol)}">${r.symbol}</a> ${money(r.price)} ${isNum(r.change) ? changeSpan(r.change) : ''} <span class="chip ${r.kind === 'AVOID' ? 'r' : ''}">${VERDICTS[r.kind]?.label} · ${r.score}/10</span><div class="small muted">${r.reason}</div></div>`)}` : '';
+  if (!active.length) return html`<div class="empty">No penny stock is in play right now (needs to be up ${Math.round(config.scalp.minUp * 100)}%+ or near a setup). Checked ${sc.updatedAt ? timeAgo(sc.updatedAt) : '–'}.</div>${quietList}`;
+  return html`<div class="cards">${active.map((r) => {
+    const v = VERDICTS[r.kind] ?? VERDICTS.WATCH;
+    const intra = engine.intra?.get(r.symbol)?.data;
+    const vw = intra ? vwapOf(intra.candles, intra.regularStart ?? 0).series : [];
+    return html`<article class="card ${v.tone}">
+<div class="card-head"><a class="tick" href="/s/${encodeURIComponent(r.symbol)}">${r.symbol}</a><div class="co">${r.name}</div>
+<div class="px"><div class="p">${money(r.price)}</div><div>${isNum(r.change) ? changeSpan(r.change) : ''} <span class="dim small">today</span></div></div></div>
+${verdictPill(r.kind)} <span class="chip ${r.score >= config.scalp.alertScore ? 'g' : r.score >= 6 ? 'a' : ''}">Scalp score ${r.score}/10</span>
+<p class="reason">${r.reason}</p>
+${r.news ? html`<div class="headline">${safeUrl(r.news.url) ? html`<a href="${safeUrl(r.news.url)}" target="_blank" rel="noopener noreferrer nofollow">${r.news.title}</a>` : r.news.title}</div>` : ''}
+${intra ? intradaySvg({ candles: intra.candles, vwapSeries: vw, regularStart: intra.regularStart, hod: r.hod, levels: r.kind === 'AVOID' ? null : r.levels, id: `i-${r.symbol}` }) : ''}
+<div class="legend"><span><i style="background:#c084fc"></i>VWAP</span><span><i style="background:#f5b83d"></i>high of day</span><span><i style="background:#e8f3ed"></i>entry</span><span><i style="background:#ef4444"></i>stop</span><span><i style="background:#22c55e"></i>targets</span></div>
+<div class="grid">
+${stat('VWAP', money(r.vwap), isNum(r.aboveVwap) ? (r.aboveVwap > 0 ? 'g' : 'r') : '')}
+${stat('High of day', money(r.hod))}
+${stat('Pre-market high', money(r.preHigh))}
+${stat('Volume vs normal', isNum(r.rvol) ? `${r.rvol.toFixed(1)}×` : '–', r.rvol >= config.scalp.rvol ? 'g' : '')}
+${stat('Volume today', compact(r.volume))}
+${stat('Last 5 min burst', isNum(r.surge) ? `${r.surge.toFixed(1)}×` : '–', r.surge >= 1.5 ? 'g' : '')}
+</div>
+${r.levels && r.kind !== 'AVOID' ? html`<div class="grid">${stat('Entry', money(r.levels.entry))}${stat('Stop', `${money(r.levels.stop)} (${pct(-r.levels.riskPct, 1)})`, 'r')}${stat(`Sell half (+${Math.round(config.scalp.t1 * 100)}%)`, money(r.levels.target1), 'g')}${stat(`Sell rest (+${Math.round(config.scalp.t2 * 100)}%)`, money(r.levels.target2), 'g')}</div>` : ''}
+<div class="tengrid">${r.items.map((i) => html`<span class="tg ${i.status}" title="${i.note}"><i>${ICON[i.status]}</i>${i.title}</span>`)}</div>
+<details class="ten-more"><summary>Why each point passed or failed</summary><ul class="ten">${r.items.map((i) => html`<li class="${i.status}"><span class="ico">${ICON[i.status]}</span><div><b>${i.title}</b><span class="small muted">${i.note}</span></div></li>`)}</ul></details>
+</article>`;
+  })}</div>${quietList}<p class="small dim">Updated ${sc.updatedAt ? timeAgo(sc.updatedAt) : '–'} · refreshes by itself every 30 seconds while this page is open.</p>`;
+}
+
+function pennyPage({ engine, part = false }) {
+  const { state, config } = engine;
+  const sc = config.scalp;
+  if (part) return scalpCards(engine);
+  const alerts = (state.scalp?.alerts ?? []).slice(0, 30);
+  const scored = alerts.filter((a) => a.result && a.result.outcome !== 'unknown');
+  const share = (o) => (scored.length ? scored.filter((a) => (Array.isArray(o) ? o.includes(a.result.outcome) : a.result.outcome === o)).length / scored.length : null);
+  const body = html`<h1>Penny scalps</h1>
+<p class="sub">Halal penny stocks (${money(sc.minPrice)}–${money(sc.maxPrice)}, Zoya COMPLIANT, real shares on XTB) checked every minute on the 1-minute chart. Scalps last minutes to a few hours. Telegram alerts only for <b>BUY NOW with a score of ${sc.alertScore}/10 or more</b>.</p>
+<div class="bubbles">
+<div class="bubble"><div class="k">Penny stocks watched</div><div class="v">${engine.pennyList().length}</div><div class="small muted">halal, on XTB, under ${money(sc.maxPrice)}</div></div>
+<div class="bubble"><div class="k">US market</div><div class="v">${{ open: 'Open', pre: 'Pre-market', post: 'After hours', closed: 'Closed' }[marketState()]}</div><div class="small muted">Opens ${openInDubai()} Dubai</div></div>
+<div class="bubble"><div class="k">Scalp alerts</div><div class="v">${alerts.length}</div><div class="small muted">${scored.length ? `${pct(share(['half', 'both']), 0, false)} reached +${Math.round(sc.t1 * 100)}%` : 'results after the close'}</div></div>
+</div>
+<details class="bubble" style="margin:12px 0"><summary><b>What we look for in a penny scalp</b></summary><ul class="small">
+<li><b>Fresh good news today</b> — no news, no trade. News gives the move a reason to continue.</li>
+<li><b>Up ${Math.round(sc.minUp * 100)}%+ on volume ${sc.rvol}× normal</b> — the crowd is already in it.</li>
+<li><b>Small float (under ${compact(sc.floatMax)})</b> — few shares, so buying pushes the price hard.</li>
+<li><b>Above VWAP</b> — the day's average price; above it buyers are winning, below it sellers are.</li>
+<li><b>Breaking the high of day on a volume burst</b> — the classic momentum entry. No burst, no buy.</li>
+<li><b>Not stretched</b> — more than ${Math.round(sc.maxAboveVwap * 100)}% above VWAP is chasing; wait for a dip.</li>
+<li><b>First 2 hours</b> — most penny breakouts happen early; later ones fail more often.</li>
+<li><b>No recent share sale</b> — penny companies often sell new shares into a spike.</li>
+<li><b>Tight plan</b> — stop under VWAP or the last 5-minute low (max ${Math.round(sc.maxStop * 100)}%), sell half at +${Math.round(sc.t1 * 100)}%, the rest at +${Math.round(sc.t2 * 100)}%.</li>
+<li>XTB real shares trade only in the regular session (9:30–16:00 New York), so pre-market setups are a plan for the open.</li></ul></details>
+<div id="scalp-live">${scalpCards(engine)}</div>
+${alerts.length ? html`<h2>Recent scalp alerts</h2><div class="scroll"><table class="list"><tr><th>Stock</th><th>When</th><th>Entry</th><th>Score</th><th>Result</th><th>Best</th></tr>
+${alerts.map((a) => html`<tr><td><b>${a.symbol}</b></td><td class="small">${dubaiTime(a.at)}</td><td>${money(a.levels?.entry)}</td><td>${a.score}/10</td><td>${a.result ? html`<span class="chip ${a.result.outcome === 'both' || a.result.outcome === 'half' ? 'g' : a.result.outcome === 'stopped' ? 'r' : ''}">${{ both: 'Both targets', half: `+${Math.round(sc.t1 * 100)}% then entry`, stopped: 'Stopped', neither: 'No target', unknown: '–' }[a.result.outcome]}</span>` : html`<span class="chip t">Today</span>`}</td><td>${a.result && isNum(a.result.maxGain) ? changeSpan(a.result.maxGain) : '–'}</td></tr>`)}</table></div>` : ''}`;
+  return layout({ title: 'Penny scalps', active: '/penny', body, config, version: engine.version, live: 'penny' });
+}
+
+module.exports = { pennyPage, layout, loginPage, homePage, newsPage, stockPage, watchlistPage, scorecardPage, statusPage, notFoundPage, tradesPage, guidePage };
 
 };
 
