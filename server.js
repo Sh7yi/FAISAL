@@ -474,7 +474,7 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
 
   const items = [];
   const add = (key, title, ok, note) => items.push({ key, title, status: ok === null ? 'na' : ok ? 'pass' : 'fail', note });
-  add('news', 'Fresh good news today', Boolean(goodNews), goodNews ? `${goodNews.title.slice(0, 90)} (${goodNews.cls.impact}/10)` : 'No good news found today — no news, no trade.');
+  add('news', 'Fresh good news', Boolean(goodNews), goodNews ? `${goodNews.title.slice(0, 90)} (${goodNews.cls.impact}/10)` : 'No good news since yesterday\'s close — no news, no trade.');
   add('price', `Penny price (${money(sc.minPrice)}–${money(sc.maxPrice)})`, isNum(price) ? price >= sc.minPrice && price <= sc.maxPrice : null, isNum(price) ? `${money(price)}${price < 1 ? ' — under $1: wider spreads, delisting risk' : ''}` : '');
   add('move', `Up ${Math.round(sc.minUp * 100)}%+ today`, isNum(change) ? change >= sc.minUp : null, isNum(change) ? `${pct(change)} vs yesterday's close` : '');
   add('rvol', `Volume ${sc.rvol}× normal`, isNum(rvol) ? rvol >= sc.rvol : null, isNum(rvol) ? `${rvol.toFixed(1)}× a normal day (projected)` : 'Not enough volume history.');
@@ -495,7 +495,7 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
     reason = state === 'pre'
       ? `Pre-market. XTB real shares trade from the 9:30 New York open. Plan: buy only if it breaks the pre-market high ${preHigh ? money(preHigh) : ''} with volume after the open.`
       : 'Market closed. Scalps happen during the session.';
-  } else if (!goodNews) { kind = 'WATCH'; reason = 'Moving, but no news found today — no news, no trade.'; }
+  } else if (!goodNews) { kind = 'WATCH'; reason = 'Moving, but no good news found since yesterday\'s close — no news, no trade.'; }
   else if (isNum(aboveVwap) && aboveVwap < -0.02) { kind = 'AVOID'; reason = `Below VWAP ${money(vwap)} — sellers are in control right now.`; }
   else if (isNum(aboveVwap) && aboveVwap > sc.maxAboveVwap) { kind = 'WAIT_PULLBACK'; reason = `Stretched ${pct(aboveVwap)} above VWAP — chasing is risky. Wait for a dip toward ${money(vwap)} that holds.`; }
   // Within 1% of the high counts as at the high: on a $1 stock that is a single cent.
@@ -1136,7 +1136,7 @@ class Engine {
       const syms = this.pennyList();
       if (syms.length) {
         try {
-          const dayStart = new Date(now.getTime() - nyClock(now).minutes * MINUTE);
+          const dayStart = new Date(now.getTime() - (nyClock(now).minutes + 8 * 60) * MINUTE);
           items.push(...(await alpaca.news(this.net, this.config, { start: dayStart, pages: 2, symbols: syms })));
         } catch (error) {
           this.net.mark('News: Benzinga (Alpaca)', false, `penny news: ${error.message}`);
@@ -1512,7 +1512,9 @@ class Engine {
         const avgVol = hist.length ? hist.reduce((a, b) => a + b, 0) / hist.length : null;
         const info = await this.companyInfo(sym);
         const fl = info.fund ? explodeCheck({ cls: { impact: 0, horizon: 'days' }, ta: null, fund: info.fund, dilution: null, market: null, sector: null, levels: null, candles: daily?.candles, config: this.config }).floatShares : null;
-        const news = s.news.filter((n) => n.symbol === sym && dayKey(n.time) === today);
+        // News since yesterday's 4pm close counts: after-hours news drives today's gap.
+        const since = now.getTime() - (nyClock(now).minutes + 8 * 60) * MINUTE;
+        const news = s.news.filter((n) => (n.symbol === sym || n.symbols?.includes(sym)) && Date.parse(n.time) >= since);
         const check = scalpCheck({ intra, avgVol, floatShares: fl, dilution: info.dilution, news, state: st, now, config: this.config });
         const { vwapSeries, ...keep } = check;
         rows.push({ symbol: sym, name: intra.name, ...keep, at: now.toISOString() });
