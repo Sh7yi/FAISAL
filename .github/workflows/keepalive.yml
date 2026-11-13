@@ -1,0 +1,15 @@
+# Opens the site's health check every 10 minutes so Render does not put it to
+# sleep: the news reader and Telegram alerts must run 24/7, even with no visitors.
+name: Keep site awake
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Ping
+        run: curl -fsS -m 90 -o /dev/null -w "%{http_code}\n" https://www.5brgold.com/health || curl -fsS -m 120 -o /dev/null -w "%{http_code}\n" https://www.5brgold.com/health || true

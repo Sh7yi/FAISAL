@@ -1,38 +1,97 @@
-# Keeps a copy of this week's economic calendar on the "feeds" branch, refreshed every hour.
-# The website reads this copy first, because the original feed often turns away shared servers like Render's.
-name: Calendar feed
-
+# Copies the data the halal site needs from websites that block Render:
+# XTB's list of US real shares (UAE offer) and the upcoming earnings dates from Nasdaq.
+# The files go to the "feeds" branch, which the site reads.
+name: Data feeds
 on:
   schedule:
-    - cron: '7 * * * *'
+    - cron: '17 */3 * * *'
   workflow_dispatch:
-
 permissions:
   contents: write
-
 concurrency:
-  group: calendar-feed
+  group: data-feeds
   cancel-in-progress: true
-
 jobs:
-  calendar:
+  feeds:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
-      - name: Download this week's calendar
+      - name: Build the XTB list and the earnings calendar
         run: |
-          for attempt in 1 2 3 4; do
-            if curl -fsS -m 30 -A "5brgold-calendar/1.0 (+https://www.5brgold.com)" -o ff.json https://nfs.faireconomy.media/ff_calendar_thisweek.json; then break; fi
-            sleep 45
-          done
-          python3 -c "import json; d = json.load(open('ff.json')); assert isinstance(d, list) and d, 'empty'; print(len(d), 'events')"
+          mkdir -p out
+          python3 - <<'PY'
+          import json, time, urllib.request, datetime
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36'
+          def get(url, extra=None):
+              err = None
+              for i in range(4):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept': 'application/json, text/plain, */*', **(extra or {})})
+                      with urllib.request.urlopen(req, timeout=40) as r:
+                          return json.load(r)
+                  except Exception as e:
+                      err = e
+                      time.sleep(5 * (i + 1))
+              raise err
+          now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+          previous = 'https://raw.githubusercontent.com/${{ github.repository }}/feeds/'
+
+          # XTB: US stocks sold as real shares (not CFDs) to clients in the UAE.
+          try:
+              items = []
+              for page in range(1, 13):
+                  j = get(f'https://www.xtb.com/web-api/v3/languages/en/branches/int/instrument-specification?pageSize=500&page={page}&typeSlug=cashstocks&offerByCountry=AE')
+                  batch = j.get('items') or []
+                  items += batch
+                  if len(batch) < 500:
+                      break
+              us = sorted({str(i['symbol']).upper().removesuffix('.US') for i in items if i.get('instrumentCountrySymbol') == 'US' and not i.get('closeOnly')})
+              assert len(us) > 200, f'only {len(us)} symbols'
+              xtb = {'updatedAt': now, 'country': 'AE', 'type': 'real shares', 'symbols': us}
+              print('XTB', len(us), 'US real shares')
+          except Exception as e:
+              print('XTB failed, keeping the last copy:', e)
+              try:
+                  xtb = get(previous + 'xtb_us.json')
+              except Exception as e2:
+                  xtb = None
+                  print('no previous XTB copy:', e2)
+          if xtb:
+              json.dump(xtb, open('out/xtb_us.json', 'w'))
+
+          # Earnings dates for the next three weeks.
+          dates = {}
+          today = datetime.date.today()
+          for k in range(0, 22):
+              day = today + datetime.timedelta(days=k)
+              if day.weekday() >= 5:
+                  continue
+              try:
+                  j = get(f'https://api.nasdaq.com/api/calendar/earnings?date={day}', {'Origin': 'https://www.nasdaq.com', 'Referer': 'https://www.nasdaq.com/'})
+                  for row in ((j.get('data') or {}).get('rows') or []):
+                      s = str(row.get('symbol') or '').upper().strip()
+                      if s and s not in dates:
+                          dates[s] = str(day)
+              except Exception as e:
+                  print('earnings', day, e)
+              time.sleep(1)
+          print('earnings dates', len(dates))
+          if dates:
+              json.dump({'updatedAt': now, 'dates': dates}, open('out/earnings.json', 'w'))
+          else:
+              try:
+                  json.dump(get(previous + 'earnings.json'), open('out/earnings.json', 'w'))
+              except Exception as e:
+                  print('no previous earnings copy:', e)
+          PY
+          ls -la out
+          test -n "$(ls out)"
       - name: Publish to the feeds branch
         run: |
-          mkdir out && cd out
+          cd out
           git init -q -b feeds
-          git config user.name "calendar-feed"
+          git config user.name "data-feeds"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          cp ../ff.json ff_calendar_thisweek.json
-          git add ff_calendar_thisweek.json
-          git commit -qm "Calendar $(date -u +%Y-%m-%dT%H:%MZ)"
+          git add .
+          git commit -qm "Feeds $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" feeds
