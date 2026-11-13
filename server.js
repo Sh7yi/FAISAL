@@ -976,6 +976,14 @@ function parseExplanation(text, count) {
   return { id: pick.id, why: pick.why.replace(/\s+/g, ' ').trim().slice(0, 260), timing: TIMINGS.has(pick.timing) ? pick.timing : 'now' };
 }
 
+// Claude's own reason (for example a low credit balance) goes on the status page.
+async function claudeError(response) {
+  let reason = '';
+  try { reason = (await response.json())?.error?.message ?? ''; } catch {}
+  reason = String(reason).replace(/\s+/g, ' ').trim().slice(0, 160);
+  return `Claude API answered ${response.status}${reason ? `: ${reason}` : ''}`;
+}
+
 async function aiExplainMove(titles, move, { key, model, version, url, fetchImpl = fetch }) {
   const response = await fetchImpl(url, {
     method: 'POST',
@@ -988,7 +996,7 @@ async function aiExplainMove(titles, move, { key, model, version, url, fetchImpl
     }),
     signal: AbortSignal.timeout(20000),
   });
-  if (!response.ok) throw new Error(`Claude API answered ${response.status}`);
+  if (!response.ok) throw new Error(await claudeError(response));
   const body = await response.json();
   return parseExplanation((body.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join(''), titles.length);
 }
@@ -1017,7 +1025,7 @@ async function aiTranslate(strings, { key, model, version, url, fetchImpl = fetc
     body: JSON.stringify({ model, max_tokens: 6000, system: TRANSLATE, messages: [{ role: 'user', content: JSON.stringify(strings) }] }),
     signal: AbortSignal.timeout(60000),
   });
-  if (!response.ok) throw new Error(`Claude API answered ${response.status}`);
+  if (!response.ok) throw new Error(await claudeError(response));
   const body = await response.json();
   const text = (body.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');
   return parseTranslation(text, strings.length);
@@ -1047,7 +1055,7 @@ async function aiText(system, content, maxTokens, { key, model, version, url, fe
     body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: JSON.stringify(content) }] }),
     signal: AbortSignal.timeout(30000),
   });
-  if (!response.ok) throw new Error(`Claude API answered ${response.status}`);
+  if (!response.ok) throw new Error(await claudeError(response));
   const body = await response.json();
   const text = (body.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
   if (!text) throw new Error('Claude gave an empty answer');
@@ -1069,7 +1077,7 @@ async function aiClassify(titles, { key, model, version, url, fetchImpl = fetch 
     }),
     signal: AbortSignal.timeout(45000),
   });
-  if (!response.ok) throw new Error(`Claude API answered ${response.status}`);
+  if (!response.ok) throw new Error(await claudeError(response));
   const body = await response.json();
   const text = (body.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');
   return parseAiReply(text);
