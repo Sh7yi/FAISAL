@@ -2001,7 +2001,7 @@ function send(res, status, body, type = 'text/html; charset=utf-8', extra = {}) 
     'cache-control': type.startsWith('text/html') || type.startsWith('application/json') ? 'no-store' : 'public, max-age=86400',
     'content-security-policy': CSP,
     'x-content-type-options': 'nosniff',
-    'referrer-policy': 'no-referrer',
+    'referrer-policy': 'same-origin',
     'x-robots-tag': 'noindex, nofollow',
     'strict-transport-security': 'max-age=31536000',
     ...extra,
@@ -2019,6 +2019,15 @@ function tooMany(ip) {
   if (!a || now > a.until) { attempts.set(ip, { count: 1, until: now + 15 * MINUTE }); return false; }
   a.count++;
   return a.count > 8;
+}
+
+// Forms must come from this site. Browsers say so in Sec-Fetch-Site; older ones send Origin.
+function fromThisSite(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site) return site === 'same-origin' || site === 'none';
+  const origin = req.headers.origin ?? req.headers.referer ?? '';
+  if (!origin || origin === 'null') return true;
+  try { return new URL(origin).host === req.headers.host; } catch { return false; }
 }
 
 function clientIp(req) {
@@ -2097,8 +2106,7 @@ function createServer(engine) {
       if (path === '/trades' && req.method === 'GET') return send(res, 200, String(pages.tradesPage({ engine, error: url.searchParams.get('e') ?? '' })));
       if (path.startsWith('/trades/') && req.method === 'POST') {
         // Only accept forms sent from this site.
-        const origin = req.headers.origin ?? req.headers.referer ?? '';
-        if (origin && !origin.includes(req.headers.host ?? '')) return send(res, 403, 'Forbidden', 'text/plain');
+        if (!fromThisSite(req)) return send(res, 403, 'Forbidden', 'text/plain');
         const form = new URLSearchParams(await readBody(req));
         try {
           if (path === '/trades/add') engine.addTrade({ symbol: form.get('symbol'), price: form.get('price') });
@@ -2114,8 +2122,7 @@ function createServer(engine) {
       if (path === '/watchlist') return send(res, 200, String(pages.watchlistPage({ engine, sort: url.searchParams.get('sort') ?? 'news' })));
       if (path === '/scorecard') return send(res, 200, String(pages.scorecardPage({ engine })));
       if (path === '/status/test-telegram' && req.method === 'POST') {
-        const origin = req.headers.origin ?? req.headers.referer ?? '';
-        if (origin && !origin.includes(req.headers.host ?? '')) return send(res, 403, 'Forbidden', 'text/plain');
+        if (!fromThisSite(req)) return send(res, 403, 'Forbidden', 'text/plain');
         const result = await engine.testTelegram();
         return redirect(res, `/status?tg=${result.ok ? 'ok' : 'fail'}&m=${encodeURIComponent(result.message)}`);
       }
