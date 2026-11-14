@@ -1,0 +1,51 @@
+# Saves the site's data (signals, trades, paper trading, scorecard, zakat date)
+# to the "halal-data" branch every 10 minutes, so nothing is lost when Render
+# restarts. It uses GitHub's own built-in permission, so no personal key is needed.
+# The site loads this copy when it starts.
+name: Save site data
+on:
+  schedule:
+    - cron: '5-59/10 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: save-site-data
+  cancel-in-progress: false
+jobs:
+  save:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Download the site's data
+        run: |
+          curl -fsS --compressed -m 120 -o new.json https://www.5brgold.com/api/backup \
+            || (sleep 30 && curl -fsS --compressed -m 120 -o new.json https://www.5brgold.com/api/backup)
+          curl -fsS -m 60 -o old.json "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/halal-data/halal-state.json" || echo '{}' > old.json
+      - name: Check it before saving
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          new = json.load(open('new.json'))
+          old = json.load(open('old.json'))
+          if not isinstance(new.get('signals'), list) or not new.get('backup', {}).get('at'):
+              sys.exit('The site did not send its data — nothing saved.')
+          # Never replace a full copy with an empty one (for example right after a failed restart).
+          old_n = len(old.get('signals') or []) + len(old.get('trades') or [])
+          new_n = len(new.get('signals') or []) + len(new.get('trades') or [])
+          if old_n >= 5 and new_n == 0:
+              sys.exit(f'The new copy is empty but the saved one has {old_n} signals and trades — kept the saved one.')
+          print('signals', len(new['signals']), 'trades', len(new.get('trades') or []), 'paper', len((new.get('paper') or {}).get('closed') or []))
+          PY
+      - name: Save it on the halal-data branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir data && mv new.json data/halal-state.json && cd data
+          git init -q -b halal-data
+          git config user.name "site-backup"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add halal-state.json
+          git commit -q -m "Site data $(date -u +%Y-%m-%dT%H:%MZ)"
+          # One commit only, replaced each time, so the repository does not grow.
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" halal-data
