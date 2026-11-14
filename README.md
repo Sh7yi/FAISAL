@@ -14,7 +14,7 @@ Personal halal stock signals. Render runs `node server.js` (one file, no depende
 | `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY` | Real-time Benzinga news and pre-market prices (free account). |
 | `ANTHROPIC_API_KEY` | Claude reads each headline. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Alerts on your phone. |
-| `GITHUB_DATA_TOKEN` | Saves signals, trades and the scorecard to the `halal-data` branch so they survive restarts. Needs Contents: Read and write on this repo. |
+| `GITHUB_DATA_TOKEN` | Not needed any more: the **Save site data** workflow copies the site's data to the `halal-data` branch every 10 minutes with GitHub's built-in permission, and the site loads it after a restart. |
 | `REQUIRE_PASSWORD`, `SITE_PASSWORD` | Optional login. Set `REQUIRE_PASSWORD=true` to lock the site. |
 | `MAX_PRICE`, `SCALP_MAX_PRICE` | Optional price limits (default: any price; penny scalps up to $10). |
 | `ALPACA_FEED` | `sip` after upgrading Alpaca to Algo Trader Plus: real-time prices for scalps and pre-market. Default `iex` (free). |

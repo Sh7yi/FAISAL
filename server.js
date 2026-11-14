@@ -957,6 +957,10 @@ class Engine {
     this.local = new FileStore(config.dataDir);
     this.remoteError = this.remote ? null : 'GITHUB_DATA_TOKEN is not set on Render';
     this.lastRemoteTry = 0;
+    // The "Save site data" workflow on GitHub copies /api/backup to the halal-data
+    // branch every 10 minutes, so no personal key is needed. backupReady stays false
+    // until the last copy has been loaded, so an empty state can never overwrite it.
+    this.backup = { ready: false, restoredFrom: null, restoreError: null, lastServedAt: null };
     this.state = emptyState();
     this.quotes = new Map();
     this.secMap = null;
@@ -972,43 +976,117 @@ class Engine {
   now() { return new Date(); }
 
   // ---------- saving ----------
-  // What the pages show: GitHub when it works, otherwise the server copy.
-  get store() {
-    return this.remote && !this.remoteError ? { durable: true, mode: 'github' } : { durable: false, mode: 'server only' };
+  backupUrl() {
+    const { repo, branch } = this.config.github;
+    return `https://raw.githubusercontent.com/${repo}/${branch}/halal-state.json`;
   }
 
-  get saveError() { return this.remote ? this.remoteError : null; }
+  // Is the GitHub copy fresh? The workflow fetches /api/backup every 10 minutes.
+  backupHealthy(now = Date.now()) {
+    if (this.remote && !this.remoteError && this.lastSave) return true;
+    if (!this.backup.ready) return false;
+    const last = this.backup.lastServedAt ? Date.parse(this.backup.lastServedAt) : null;
+    return last ? now - last < 35 * MINUTE : now - Date.parse(this.started) < 35 * MINUTE;
+  }
+
+  // What the pages show.
+  get store() {
+    return this.backupHealthy() ? { durable: true, mode: 'github' } : { durable: false, mode: 'server only' };
+  }
+
+  get saveError() {
+    if (this.backupHealthy()) return null;
+    return this.backup.restoreError ?? 'no GitHub backup in the last 30 minutes';
+  }
 
   markStorage() {
-    if (this.remote && !this.remoteError) this.net.mark('History storage', true, 'saving to GitHub (kept after restarts)');
-    else this.net.mark('History storage', false, `${this.remoteError} — saving on the server only (lost on restart)`);
+    const b = this.backup;
+    const ago = b.lastServedAt ? Math.round((Date.now() - Date.parse(b.lastServedAt)) / MINUTE) : null;
+    if (this.backupHealthy()) {
+      const detail = b.lastServedAt
+        ? `copied to GitHub every 10 minutes — last copy ${ago} min ago`
+        : `waiting for the first copy to GitHub (every 10 minutes)${b.restoredFrom ? `; loaded ${b.restoredFrom}` : ''}`;
+      this.net.mark('History storage', true, detail);
+    } else {
+      this.net.mark('History storage', false, b.restoreError
+        ? `could not load the GitHub copy (${b.restoreError}) — will try again in 5 minutes`
+        : 'no copy to GitHub in the last 30 minutes — check the "Save site data" workflow in the GitHub Actions tab');
+    }
   }
 
+  // Loads the newest saved copy: the GitHub backup, the key-based store (if a key is set) or the server file.
   async load() {
-    let text = null;
+    const found = [];
+    const take = (text, from) => {
+      try { const st = JSON.parse(text); if (st && Array.isArray(st.signals)) found.push({ st, from }); } catch { /* damaged copy */ }
+    };
+    try {
+      take(await this.net.text(this.backupUrl(), { timeout: 30000, retries: 2 }), 'GitHub backup');
+      this.backup.ready = true;
+    } catch (error) {
+      // 404 = nothing saved yet, which is fine. Anything else: try again later, and
+      // refuse to hand out a backup meanwhile so the good copy is not overwritten.
+      if (/answered 404/.test(error.message)) this.backup.ready = true;
+      else this.backup.restoreError = error.message;
+    }
     if (this.remote) {
       try {
-        text = await this.remote.read('halal-state.json');
+        const text = await this.remote.read('halal-state.json');
+        if (text) take(text, 'GitHub (key)');
         this.remoteError = null;
       } catch (error) {
         this.remoteError = error.message;
       }
     }
-    if (!text) {
-      try { text = await this.local.read('halal-state.json'); } catch { /* nothing saved yet */ }
+    try { const text = await this.local.read('halal-state.json'); if (text) take(text, 'server copy'); } catch { /* nothing saved yet */ }
+    found.sort((a, b) => String(b.st.savedAt ?? '').localeCompare(String(a.st.savedAt ?? '')));
+    if (found[0]) {
+      this.state = { ...emptyState(), ...found[0].st };
+      this.backup.restoredFrom = `${found[0].from}${found[0].st.savedAt ? ` saved ${found[0].st.savedAt.slice(0, 16).replace('T', ' ')} UTC` : ''}`;
     }
+    if (this.backup.restoreError) this.backup.ready = false;
+    this.markStorage();
+  }
+
+  // If GitHub could not be reached at start-up, keep trying, then merge the old copy in.
+  async retryRestore() {
+    if (this.backup.ready) return;
     try {
-      if (text) this.state = { ...emptyState(), ...JSON.parse(text) };
-    } catch {
-      // A damaged file should not stop the site.
+      const old = JSON.parse(await this.net.text(this.backupUrl(), { timeout: 30000, retries: 1 }));
+      const union = (a = [], b = []) => { const ids = new Set(a.map((x) => x.id)); return [...a, ...b.filter((x) => !ids.has(x.id))]; };
+      const cur = this.state;
+      this.state = {
+        ...emptyState(), ...old,
+        signals: union(cur.signals, old.signals),
+        news: union(cur.news, old.news).slice(0, 600),
+        trades: union(cur.trades, old.trades),
+        seen: { ...old.seen, ...cur.seen },
+        titles: { ...old.titles, ...cur.titles },
+      };
+      this.backup = { ...this.backup, ready: true, restoreError: null, restoredFrom: `GitHub backup (late)${old.savedAt ? ` saved ${old.savedAt.slice(0, 16).replace('T', ' ')} UTC` : ''}` };
+      this.touch();
+    } catch (error) {
+      if (/answered 404/.test(error.message)) this.backup = { ...this.backup, ready: true, restoreError: null };
+      else this.backup.restoreError = error.message;
     }
     this.markStorage();
+  }
+
+  // What the GitHub workflow saves. Null until the last copy has been loaded.
+  backupBody() {
+    if (!this.backup.ready) return null;
+    const now = new Date().toISOString();
+    this.state.savedAt = now;
+    this.backup.lastServedAt = now;
+    this.markStorage();
+    return JSON.stringify({ ...this.state, backup: { at: now, started: this.started } });
   }
 
   async save(force = false) {
     if (!this.dirty && !force) return;
     if (!force && Date.now() - this.lastSave < 3 * MINUTE) return;
     this.lastSave = Date.now();
+    this.state.savedAt = new Date().toISOString();
     const body = JSON.stringify(this.state);
     try { await this.local.write({ 'halal-state.json': body }); } catch { /* the GitHub copy still counts */ }
     // After a GitHub failure, try again every 10 minutes (the key may have been fixed).
@@ -1857,6 +1935,8 @@ class Engine {
   }
 
   async maintain() {
+    await this.retryRestore();
+    this.markStorage();
     await this.refreshLists();
     await this.refreshUniverse();
     await this.refreshMarket();
@@ -1888,7 +1968,6 @@ class Engine {
       { key: 'ALPACA_KEY_ID + ALPACA_SECRET_KEY', ok: alpaca.enabled(c), what: 'Real-time Benzinga news (free account).' },
       { key: 'ANTHROPIC_API_KEY', ok: Boolean(c.ai.key), what: 'Claude reads each headline.' },
       { key: 'TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID', ok: Boolean(c.telegram.token && c.telegram.chatId), what: 'Alerts on your phone.' },
-      { key: 'GITHUB_DATA_TOKEN', ok: Boolean(this.remote) && !this.remoteError, what: this.remoteError ? `Keeps signals, trades and the scorecard after restarts. Now: ${this.remoteError}` : 'Keeps signals, trades and the scorecard after restarts.' },
     ];
   }
 
@@ -3161,6 +3240,7 @@ __defs["server"] = (module, exports, require) => {
 // The web server: password lock, pages, and a few small endpoints.
 const http = require('node:http');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const { loadConfig } = require('./config');
 const { Engine } = require('./engine');
 const { analyze } = require('./analysis/ta');
@@ -3350,6 +3430,13 @@ function createServer(engine) {
       if (path === '/login' || path === '/logout') return redirect(res, '/');
 
       if (path === '/api/version') return send(res, 200, JSON.stringify({ v: engine.version }), 'application/json');
+      // The site's data for the "Save site data" workflow on GitHub (gzip when asked).
+      if (path === '/api/backup') {
+        const body = engine.backupBody();
+        if (!body) return send(res, 503, JSON.stringify({ ok: false, why: 'still loading the last copy' }), 'application/json');
+        if (String(req.headers['accept-encoding'] ?? '').includes('gzip')) return send(res, 200, zlib.gzipSync(body), 'application/json', { 'content-encoding': 'gzip' });
+        return send(res, 200, body, 'application/json');
+      }
 
       if (path === '/') {
         const filter = ['all', 'buy', 'wait', 'avoid'].includes(url.searchParams.get('f')) ? url.searchParams.get('f') : 'all';
