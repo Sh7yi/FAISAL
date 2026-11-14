@@ -505,6 +505,10 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
   const preHigh = pre.length ? Math.max(...pre.map((c) => c.h)) : null;
   const hod = regular.length ? Math.max(...regular.map((c) => c.h)) : preHigh;
   const change = price && prev ? price / prev - 1 : null;
+  // The gap: before the open, where pre-market trades now; after it, where the stock opened.
+  const openPrice = regular[0]?.o ?? null;
+  const gap = prev ? ((openPrice ?? (state === 'pre' ? price : null)) ?? null) / prev - 1 : null;
+  const gapper = isNum(gap) && gap >= (sc.minGap ?? 0);
   const volume = intra?.volume ?? regular.reduce((s, c) => s + (c.v || 0), 0);
   const minutesIn = state === 'open' ? Math.max(1, nyClock(now).minutes - (9 * 60 + 30)) : 0;
   const expected = state === 'open' ? Math.min(1, Math.max(0.12, (minutesIn / 390) ** 0.7)) : 1;
@@ -520,7 +524,7 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
   const add = (key, title, ok, note) => items.push({ key, title, status: ok === null ? 'na' : ok ? 'pass' : 'fail', note });
   add('news', 'Fresh good news', Boolean(goodNews), goodNews ? `${goodNews.title.slice(0, 90)} (${goodNews.cls.impact}/10)` : 'No good news since yesterday\'s close — no news, no trade.');
   add('price', `Penny price (${money(sc.minPrice)}–${money(sc.maxPrice)})`, isNum(price) ? price >= sc.minPrice && price <= sc.maxPrice : null, isNum(price) ? `${money(price)}${price < 1 ? ' — under $1: wider spreads, delisting risk' : ''}` : '');
-  add('move', `Up ${Math.round(sc.minUp * 100)}%+ today`, isNum(change) ? change >= sc.minUp : null, isNum(change) ? `${pct(change)} vs yesterday's close` : '');
+  add('move', `Gapped up ${Math.round((sc.minGap ?? sc.minUp) * 100)}%+`, isNum(gap) ? gapper : null, isNum(gap) ? `${openPrice ? 'Opened' : 'Pre-market'} ${pct(gap)} vs yesterday's close${isNum(change) && openPrice ? ` · now ${pct(change)}` : ''}` : '');
   add('rvol', `Volume ${sc.rvol}× normal`, isNum(rvol) ? rvol >= sc.rvol : null, isNum(rvol) ? `${rvol.toFixed(1)}× a normal day (projected)` : 'Not enough volume history.');
   add('liquid', `${compact(sc.minVolume)}+ shares traded`, volume ? volume >= sc.minVolume * Math.min(1, expected * 2) : null, `${compact(volume)} shares today — enough to get in and out quickly`);
   add('float', `Float under ${compact(sc.floatMax)}`, isNum(floatShares) ? floatShares < sc.floatMax : null, isNum(floatShares) ? `About ${compact(floatShares)} shares` : 'Float not found.');
@@ -532,7 +536,8 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
 
   let kind; let reason;
   const ok = (key) => items.find((i) => i.key === key)?.status === 'pass';
-  if (dilution?.level === 'recent') { kind = 'AVOID'; reason = 'Recent share sale filed — penny stocks often sell new shares into a spike.'; }
+  if (!gapper) { kind = 'WATCH'; reason = `Not a ${Math.round((sc.minGap ?? 0) * 100)}%+ gapper${isNum(gap) ? ` (gap ${pct(gap)})` : ''} — this page only trades the biggest gaps.`; }
+  else if (dilution?.level === 'recent') { kind = 'AVOID'; reason = 'Recent share sale filed — penny stocks often sell new shares into a spike.'; }
   else if (isNum(change) && change < 0) { kind = 'AVOID'; reason = 'Down on the day — scalps work on the strongest stocks, not the weakest.'; }
   else if (state !== 'open') {
     kind = 'WATCH';
@@ -548,7 +553,7 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
     reason = kind === 'WAIT_BREAKOUT' ? `Just under the high of day ${money(hod)}. Buy only on a break above ${money(hod * 1.003)} with a volume burst.` : `Pulled back from the high ${money(hod)}. Wait for it to curl back up above VWAP with volume.`;
   } else if (!ok('rvol') || !ok('move') || !ok('surge')) {
     kind = 'WATCH';
-    reason = !ok('move') ? 'Not up enough today to be a real runner.' : !ok('rvol') ? 'Volume is not heavy enough yet.' : 'At the high, but no fresh burst of volume — breakouts without volume fail.';
+    reason = !ok('move') ? 'The gap is not big enough.' : !ok('rvol') ? 'Volume is not heavy enough yet.' : 'At the high, but no fresh burst of volume — breakouts without volume fail.';
   } else {
     kind = 'BUY_NOW';
     reason = `Breaking the high of day ${money(hod)} on a volume burst, above VWAP, with news.${prime ? '' : ' Note: later in the day breakouts fail more often.'}`;
@@ -562,8 +567,8 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
   let stop = Math.max(entry * (1 - sc.maxStop), Math.min(vwap ? vwap * 0.99 : entry * 0.95, recentLow ? recentLow * 0.995 : entry * 0.95));
   if (!(stop < entry * 0.985)) stop = entry * 0.97;
   const levels = isNum(entry) ? { entry, stop, target1: entry * (1 + sc.t1), target2: entry * (1 + sc.t2), riskPct: 1 - stop / entry, rr: (sc.t2) / (1 - stop / entry) } : null;
-  const alert = kind === 'BUY_NOW' && (score >= sc.alertScore + (prime ? 0 : 1));
-  return { kind, reason, items, score, levels, vwap, vwapSeries: series, hod, preHigh, change, volume, rvol, surge, aboveVwap, prime, price, news: goodNews, alert };
+  const alert = gapper && kind === 'BUY_NOW' && (score >= sc.alertScore + (prime ? 0 : 1));
+  return { kind, reason, items, score, levels, vwap, vwapSeries: series, hod, preHigh, change, gap, gapper, volume, rvol, surge, aboveVwap, prime, price, news: goodNews, alert };
 }
 
 module.exports = { scalpCheck, vwapOf };
@@ -825,6 +830,8 @@ function loadConfig(env = process.env) {
       maxPrice: num(env.SCALP_MAX_PRICE, 10),
       alertsPerDay: num(env.SCALP_ALERTS_PER_DAY, 3),
       minUp: num(env.SCALP_MIN_UP, 0.1),
+      // Only 30%+ gappers: before the open the pre-market price, after it the opening price, vs yesterday's close.
+      minGap: num(env.SCALP_MIN_GAP, 0.3),
       rvol: num(env.SCALP_RVOL, 5),
       minVolume: num(env.SCALP_MIN_VOLUME, 1e6),
       floatMax: num(env.SCALP_FLOAT_MAX, 20e6),
@@ -2416,7 +2423,7 @@ const mixin = {
         row.resumeAt = h.resumeAt;
         this.touch();
       }
-      const up = isNum(row.change) && row.change >= 0.1;
+      const up = isNum(row.change) && row.change >= this.config.scalp.minGap;
       const worth = up && !['H4', 'H9', 'H10'].includes(row.reason);
       const sent = s.halts.list.filter((x) => x.alertedHalt).length;
       if (worth && !row.alertedHalt && sent < 5) {
@@ -2737,7 +2744,7 @@ const mixin = {
     }
 
     // Penny: the top 3 pre-market setups, as plans for the open.
-    const penny = (s.scalp?.rows ?? []).filter((r) => isNum(r.change) && r.change >= this.config.scalp.minUp && r.news && r.kind !== 'AVOID')
+    const penny = (s.scalp?.rows ?? []).filter((r) => r.gapper && r.news && r.kind !== 'AVOID')
       .sort((a, b) => b.score - a.score || b.change - a.change).slice(0, 3);
     if (penny.length) {
       lines.push('', 'Penny scalps to watch at the open:');
@@ -5541,10 +5548,12 @@ function scalpCards(engine) {
   if (!sc.rows?.length) {
     return html`<div class="empty">${engine.pennyList().length ? (ms === 'closed' || ms === 'post' ? 'Market closed — the penny scanner runs from 4:00 to 16:00 New York time (pre-market included).' : 'Scanning… the first results appear within a minute.') : 'No halal penny stocks on your XTB list right now.'}</div>`;
   }
-  const active = sc.rows.filter((r) => ['BUY_NOW', 'WAIT_BREAKOUT', 'WAIT_PULLBACK'].includes(r.kind) || (r.kind === 'WATCH' && r.change >= config.scalp.minUp));
-  const quiet = sc.rows.filter((r) => !active.includes(r));
-  const quietList = quiet.length ? html`<h3 style="margin-top:18px">Not in play right now</h3>${quiet.map((r) => html`<div class="news-row"><a class="chip" href="/s/${encodeURIComponent(r.symbol)}">${r.symbol}</a> ${money(r.price)} ${isNum(r.change) ? changeSpan(r.change) : ''} <span class="chip ${r.kind === 'AVOID' ? 'r' : ''}">${VERDICTS[r.kind]?.label} · ${r.score}/10</span><div class="small muted">${r.reason}</div></div>`)}` : '';
-  if (!active.length) return html`<div class="empty">No penny stock is in play right now (needs to be up ${Math.round(config.scalp.minUp * 100)}%+ or near a setup). Checked ${sc.updatedAt ? timeAgo(sc.updatedAt) : '–'}.</div>${quietList}`;
+  // Only 30%+ gappers are shown; everything else stays hidden.
+  const gappers = sc.rows.filter((r) => r.gapper);
+  const active = gappers.filter((r) => ['BUY_NOW', 'WAIT_BREAKOUT', 'WAIT_PULLBACK', 'WATCH'].includes(r.kind));
+  const quiet = gappers.filter((r) => !active.includes(r));
+  const quietList = quiet.length ? html`<h3 style="margin-top:18px">Gappers to stay away from</h3>${quiet.map((r) => html`<div class="news-row"><a class="chip" href="/s/${encodeURIComponent(r.symbol)}">${r.symbol}</a> ${money(r.price)} ${isNum(r.change) ? changeSpan(r.change) : ''} <span class="chip ${r.kind === 'AVOID' ? 'r' : ''}">${VERDICTS[r.kind]?.label} · ${r.score}/10</span><div class="small muted">${r.reason}</div></div>`)}` : '';
+  if (!active.length) return html`<div class="empty">No halal penny stock is gapping up ${Math.round(config.scalp.minGap * 100)}%+ right now. ${sc.rows.length} checked ${sc.updatedAt ? timeAgo(sc.updatedAt) : '–'}.</div>${quietList}`;
   return html`<div class="cards">${active.map((r) => {
     const v = VERDICTS[r.kind] ?? VERDICTS.WATCH;
     const intra = engine.intra?.get(r.symbol)?.data;
@@ -5573,7 +5582,7 @@ ${r.levels && r.kind !== 'AVOID' ? html`<div class="grid">${stat('Entry', money(
 }
 
 function haltsBox(engine) {
-  const list = engine.state.halts?.list ?? [];
+  const list = (engine.state.halts?.list ?? []).filter((h) => isNum(h.change) && h.change >= engine.config.scalp.minGap);
   if (!list.length) return '';
   return html`<h2>Halted today</h2><div class="cards">${list.slice(0, 8).map((h) => html`<div class="mini"><a class="tick" href="/s/${encodeURIComponent(h.symbol)}">${h.symbol}</a>
 <span class="chip ${h.resumeAt && Date.now() >= Date.parse(h.resumeAt) ? 'g' : 'r'}">${h.resumeAt && Date.now() >= Date.parse(h.resumeAt) ? '▶ Resumed' : '⏸ Halted'}</span>
@@ -5597,7 +5606,7 @@ function pennyPage({ engine, part = false }) {
 </div>
 <details class="bubble" style="margin:12px 0"><summary><b>What we look for in a penny scalp</b></summary><ul class="small">
 <li><b>Fresh good news today</b> — no news, no trade. News gives the move a reason to continue.</li>
-<li><b>Up ${Math.round(sc.minUp * 100)}%+ on volume ${sc.rvol}× normal</b> — the crowd is already in it.</li>
+<li><b>Gapped up ${Math.round(sc.minGap * 100)}%+</b> (pre-market price, then the opening price, against yesterday's close) <b>on volume ${sc.rvol}× normal</b> — only the biggest gappers are shown.</li>
 <li><b>Small float (under ${compact(sc.floatMax)})</b> — few shares, so buying pushes the price hard.</li>
 <li><b>Above VWAP</b> — the day's average price; above it buyers are winning, below it sellers are.</li>
 <li><b>Breaking the high of day on a volume burst</b> — the classic momentum entry. No burst, no buy.</li>
