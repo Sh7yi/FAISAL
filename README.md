@@ -16,6 +16,11 @@ Personal halal stock signals. Render runs `node server.js` (one file, no depende
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Alerts on your phone. |
 | `GITHUB_DATA_TOKEN` | Saves signals, trades and the scorecard to the `halal-data` branch so they survive restarts. Needs Contents: Read and write on this repo. |
 | `REQUIRE_PASSWORD`, `SITE_PASSWORD` | Optional login. Set `REQUIRE_PASSWORD=true` to lock the site. |
-| `MAX_PRICE`, `SCALP_MAX_PRICE` | Optional price limits (default: any price; penny scalps up to $5). |
+| `MAX_PRICE`, `SCALP_MAX_PRICE` | Optional price limits (default: any price; penny scalps up to $10). |
+| `ALPACA_FEED` | `sip` after upgrading Alpaca to Algo Trader Plus: real-time prices for scalps and pre-market. Default `iex` (free). |
+| `MIN_RR` | Reward needed against risk for BUY NOW (default 2). |
+| `SWING_ALERTS_PER_DAY`, `SCALP_ALERTS_PER_DAY` | Telegram limits (default 3 and 3). |
+| `OWNER_NAME` | Optional name for the greeting on the home page. |
+| `FX_COST`, `AED_RATE` | XTB currency cost each way (default 0.005) and the dirham rate (default 3.6725). |
 
 The GitHub workflows copy XTB's stock list and earnings dates to the `feeds` branch every 3 hours, and ping the site every 10 minutes so it never sleeps.
