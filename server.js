@@ -792,7 +792,7 @@ __defs["engine"] = (module, exports, require) => {
 // minute, judges it, builds trade plans, sends alerts and tracks results.
 const crypto = require('node:crypto');
 const { Net } = require('./net');
-const { createStore } = require('./store');
+const { FileStore, GitHubStore } = require('./store');
 const yahoo = require('./sources/yahoo');
 const alpaca = require('./sources/alpaca');
 const { fetchWires } = require('./sources/wires');
@@ -845,14 +845,18 @@ class Engine {
   constructor(config, { fetchImpl = fetch, store } = {}) {
     this.config = config;
     this.net = new Net(fetchImpl);
-    this.store = store ?? createStore(config, fetchImpl);
+    // Saved twice: on GitHub (survives restarts) and on the server (backup).
+    const { token, repo, branch, api } = config.github;
+    this.remote = store ?? (token && repo ? new GitHubStore({ token, repo, branch, api, fetchImpl }) : null);
+    this.local = new FileStore(config.dataDir);
+    this.remoteError = this.remote ? null : 'GITHUB_DATA_TOKEN is not set on Render';
+    this.lastRemoteTry = 0;
     this.state = emptyState();
     this.quotes = new Map();
     this.secMap = null;
     this.secMapAt = 0;
     this.dirty = false;
     this.lastSave = 0;
-    this.saveError = null;
     this.timers = [];
     this.busy = {};
     this.started = new Date().toISOString();
@@ -862,42 +866,57 @@ class Engine {
   now() { return new Date(); }
 
   // ---------- saving ----------
+  // What the pages show: GitHub when it works, otherwise the server copy.
+  get store() {
+    return this.remote && !this.remoteError ? { durable: true, mode: 'github' } : { durable: false, mode: 'server only' };
+  }
+
+  get saveError() { return this.remote ? this.remoteError : null; }
+
+  markStorage() {
+    if (this.remote && !this.remoteError) this.net.mark('History storage', true, 'saving to GitHub (kept after restarts)');
+    else this.net.mark('History storage', false, `${this.remoteError} — saving on the server only (lost on restart)`);
+  }
+
   async load() {
-    try {
-      const text = await this.store.read('halal-state.json');
-      if (text) this.state = { ...emptyState(), ...JSON.parse(text) };
-      this.net.mark('History storage', true, this.store.durable ? 'saving to GitHub' : 'on the server (resets when the site restarts)');
-    } catch (error) {
-      if (this.store.mode === 'github') {
-        const { FileStore } = require('./store');
-        this.store = new FileStore(this.config.dataDir);
-        this.net.mark('History storage', true, 'on the server (resets when the site restarts)');
-      } else {
-        this.net.mark('History storage', false, error.message);
+    let text = null;
+    if (this.remote) {
+      try {
+        text = await this.remote.read('halal-state.json');
+        this.remoteError = null;
+      } catch (error) {
+        this.remoteError = error.message;
       }
     }
+    if (!text) {
+      try { text = await this.local.read('halal-state.json'); } catch { /* nothing saved yet */ }
+    }
+    try {
+      if (text) this.state = { ...emptyState(), ...JSON.parse(text) };
+    } catch {
+      // A damaged file should not stop the site.
+    }
+    this.markStorage();
   }
 
   async save(force = false) {
     if (!this.dirty && !force) return;
     if (!force && Date.now() - this.lastSave < 3 * MINUTE) return;
     this.lastSave = Date.now();
-    try {
-      await this.store.write({ 'halal-state.json': JSON.stringify(this.state) });
-      this.dirty = false;
-      this.saveError = null;
-      this.net.mark('History storage', true, this.store.durable ? 'saving to GitHub' : 'on the server (resets when the site restarts)');
-    } catch (error) {
-      if (this.store.mode === 'github' && /answered (401|403|404)/.test(error.message)) {
-        // The owner chose not to use GitHub for saving: keep data on the server from now on.
-        const { FileStore } = require('./store');
-        this.store = new FileStore(this.config.dataDir);
-        this.lastSave = 0;
-        return this.save(true);
+    const body = JSON.stringify(this.state);
+    try { await this.local.write({ 'halal-state.json': body }); } catch { /* the GitHub copy still counts */ }
+    // After a GitHub failure, try again every 10 minutes (the key may have been fixed).
+    if (this.remote && (!this.remoteError || force || Date.now() - this.lastRemoteTry > 10 * MINUTE)) {
+      this.lastRemoteTry = Date.now();
+      try {
+        await this.remote.write({ 'halal-state.json': body });
+        this.remoteError = null;
+      } catch (error) {
+        this.remoteError = error.message;
       }
-      this.saveError = error.message;
-      this.net.mark('History storage', false, error.message);
     }
+    this.dirty = false;
+    this.markStorage();
   }
 
   touch() { this.dirty = true; this.version++; }
@@ -1717,6 +1736,7 @@ class Engine {
       { key: 'ALPACA_KEY_ID + ALPACA_SECRET_KEY', ok: alpaca.enabled(c), what: 'Real-time Benzinga news (free account).' },
       { key: 'ANTHROPIC_API_KEY', ok: Boolean(c.ai.key), what: 'Claude reads each headline.' },
       { key: 'TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID', ok: Boolean(c.telegram.token && c.telegram.chatId), what: 'Alerts on your phone.' },
+      { key: 'GITHUB_DATA_TOKEN', ok: Boolean(this.remote) && !this.remoteError, what: this.remoteError ? `Keeps signals, trades and the scorecard after restarts. Now: ${this.remoteError}` : 'Keeps signals, trades and the scorecard after restarts.' },
     ];
   }
 
@@ -3012,7 +3032,12 @@ class GitHubStore {
       signal: AbortSignal.timeout(30000),
     });
     if (allow404 && response.status === 404) return null;
-    if (!response.ok) throw new Error(`GitHub answered ${response.status} on ${method} ${path.split('?')[0]}`);
+    if (!response.ok) {
+      let reason = '';
+      try { reason = (await response.json())?.message ?? ''; } catch {}
+      const hint = response.status === 401 ? ' (key is wrong or expired)' : response.status === 403 ? ' (key needs Contents: Read and write on this repo)' : '';
+      throw new Error(`GitHub answered ${response.status}${hint}${reason ? `: ${reason}` : ''}`);
+    }
     return accept.includes('raw') ? response.text() : response.json();
   }
 
