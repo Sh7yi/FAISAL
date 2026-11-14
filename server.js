@@ -906,6 +906,7 @@ const { explain } = require('./analysis/explain');
 const { scalpCheck } = require('./analysis/scalp');
 const { alertText, scalpAlertText, sendTelegram } = require('./telegram');
 const { alertWorthy, rankScore } = require('./analysis/rank');
+const tgstore = require('./sources/tgstore');
 const { MINUTE, HOUR, DAY, sleep, marketState, dayKey, nyClock, isWeekday, money, pct, compact, openInDubai } = require('./lib/util');
 
 const SECTOR_ETFS = ['XBI', 'XLK', 'SMH', 'XLV', 'XLE', 'XLB', 'XLY', 'XLI', 'XLC', 'XLU', 'XLP', 'ITA'];
@@ -963,6 +964,8 @@ class Engine {
     // branch every 10 minutes, so no personal key is needed. backupReady stays false
     // until the last copy has been loaded, so an empty state can never overwrite it.
     this.backup = { ready: false, restoredFrom: null, restoreError: null, lastServedAt: null };
+    // The pinned copy in the Telegram chat, saved every 10 minutes.
+    this.tg = { on: Boolean(config.telegram.token && config.telegram.chatId), messageId: null, lastSave: 0, error: null };
     this.state = emptyState();
     this.quotes = new Map();
     this.secMap = null;
@@ -986,6 +989,7 @@ class Engine {
   // Is the GitHub copy fresh? The workflow fetches /api/backup every 10 minutes.
   backupHealthy(now = Date.now()) {
     if (this.remote && !this.remoteError && this.lastSave) return true;
+    if (this.tg.on && this.backup.ready && !this.tg.error && (this.tg.lastSave ? now - this.tg.lastSave < 25 * MINUTE : now - Date.parse(this.started) < 15 * MINUTE)) return true;
     if (!this.backup.ready) return false;
     const last = this.backup.lastServedAt ? Date.parse(this.backup.lastServedAt) : null;
     return last ? now - last < 35 * MINUTE : now - Date.parse(this.started) < 35 * MINUTE;
@@ -1004,11 +1008,16 @@ class Engine {
   markStorage() {
     const b = this.backup;
     const ago = b.lastServedAt ? Math.round((Date.now() - Date.parse(b.lastServedAt)) / MINUTE) : null;
+    const tgAgo = this.tg.lastSave ? Math.round((Date.now() - this.tg.lastSave) / MINUTE) : null;
     if (this.backupHealthy()) {
-      const detail = b.lastServedAt
-        ? `copied to GitHub every 10 minutes — last copy ${ago} min ago`
-        : `waiting for the first copy to GitHub (every 10 minutes)${b.restoredFrom ? `; loaded ${b.restoredFrom}` : ''}`;
-      this.net.mark('History storage', true, detail);
+      const parts = [];
+      if (this.tg.on && !this.tg.error) parts.push(tgAgo !== null ? `pinned copy in your Telegram chat, every 10 minutes — last ${tgAgo} min ago` : 'pinned copy in your Telegram chat, every 10 minutes');
+      if (b.lastServedAt) parts.push(`GitHub copy ${ago} min ago`);
+      if (!parts.length) parts.push('waiting for the first copy');
+      if (b.restoredFrom) parts.push(`loaded ${b.restoredFrom}`);
+      this.net.mark('History storage', true, parts.join(' · '));
+    } else if (this.tg.error) {
+      this.net.mark('History storage', false, `${this.tg.error} — will try again in 10 minutes`);
     } else {
       this.net.mark('History storage', false, b.restoreError
         ? `could not load the GitHub copy (${b.restoreError}) — will try again in 5 minutes`
@@ -1031,6 +1040,14 @@ class Engine {
       if (/answered 404/.test(error.message)) this.backup.ready = true;
       else this.backup.restoreError = error.message;
     }
+    if (this.tg.on) {
+      try {
+        const got = await tgstore.readBackup(this.net, this.config);
+        if (got) { take(got.text, 'Telegram backup'); this.tg.messageId = got.messageId; }
+      } catch (error) {
+        this.backup.restoreError = error.message;
+      }
+    }
     if (this.remote) {
       try {
         const text = await this.remote.read('halal-state.json');
@@ -1050,11 +1067,28 @@ class Engine {
     this.markStorage();
   }
 
-  // If GitHub could not be reached at start-up, keep trying, then merge the old copy in.
+  // If a saved copy could not be read at start-up, keep trying, then merge the newest one in.
   async retryRestore() {
     if (this.backup.ready) return;
+    const found = [];
+    const errors = [];
     try {
-      const old = JSON.parse(await this.net.text(this.backupUrl(), { timeout: 30000, retries: 1 }));
+      found.push({ st: JSON.parse(await this.net.text(this.backupUrl(), { timeout: 30000, retries: 1 })), from: 'GitHub backup' });
+    } catch (error) {
+      if (!/answered 404/.test(error.message)) errors.push(error.message);
+    }
+    if (this.tg.on) {
+      try {
+        const got = await tgstore.readBackup(this.net, this.config);
+        if (got) { found.push({ st: JSON.parse(got.text), from: 'Telegram backup' }); this.tg.messageId = got.messageId; }
+      } catch (error) {
+        errors.push(error.message);
+      }
+    }
+    if (errors.length) { this.backup.restoreError = errors.join('; '); this.markStorage(); return; }
+    found.sort((a, b) => String(b.st.savedAt ?? '').localeCompare(String(a.st.savedAt ?? '')));
+    const old = found[0]?.st;
+    if (old) {
       const union = (a = [], b = []) => { const ids = new Set(a.map((x) => x.id)); return [...a, ...b.filter((x) => !ids.has(x.id))]; };
       const cur = this.state;
       this.state = {
@@ -1065,12 +1099,9 @@ class Engine {
         seen: { ...old.seen, ...cur.seen },
         titles: { ...old.titles, ...cur.titles },
       };
-      this.backup = { ...this.backup, ready: true, restoreError: null, restoredFrom: `GitHub backup (late)${old.savedAt ? ` saved ${old.savedAt.slice(0, 16).replace('T', ' ')} UTC` : ''}` };
       this.touch();
-    } catch (error) {
-      if (/answered 404/.test(error.message)) this.backup = { ...this.backup, ready: true, restoreError: null };
-      else this.backup.restoreError = error.message;
     }
+    this.backup = { ...this.backup, ready: true, restoreError: null, restoredFrom: old ? `${found[0].from} (late)${old.savedAt ? ` saved ${old.savedAt.slice(0, 16).replace('T', ' ')} UTC` : ''}` : this.backup.restoredFrom };
     this.markStorage();
   }
 
@@ -1101,6 +1132,18 @@ class Engine {
         this.remoteError = error.message;
       }
     }
+    // The pinned Telegram copy: every 10 minutes, and right before a restart.
+    // Never before the old copy has been loaded, so an empty start cannot replace it.
+    if (this.tg.on && this.backup.ready && (force || Date.now() - this.tg.lastSave >= 10 * MINUTE)) {
+      try {
+        this.tg.messageId = await tgstore.writeBackup(this.net, this.config, body, this.tg.messageId);
+        this.tg.lastSave = Date.now();
+        this.tg.error = null;
+      } catch (error) {
+        this.tg.error = error.message;
+        this.tg.lastSave = Date.now(); // wait 10 minutes before trying again
+      }
+    }
     this.dirty = false;
     this.markStorage();
   }
@@ -1128,6 +1171,8 @@ class Engine {
     loop(() => this.scanScalps(), MINUTE, 'scalp');
     loop(() => this.pollBuzz(), 15 * MINUTE, 'buzz');
     loop(() => this.scanEvents(), 30 * MINUTE, 'events');
+    // Opening our own address counts as a visit, so Render never puts the site to sleep.
+    loop(() => this.net.request(`${this.config.siteUrl}/health`, { timeout: 30000, retries: 0 }).catch(() => {}), 10 * MINUTE, 'awake');
   }
 
   stop() { this.timers.forEach(clearInterval); this.timers = []; }
@@ -4017,6 +4062,75 @@ function sectorOf(sic) {
 }
 
 module.exports = { tickerMap, submissions, dilutionOf, fundamentals, fundamentalsFrom, sectorOf };
+
+};
+
+// ---------- sources/tgstore.js ----------
+__defs["sources/tgstore"] = (module, exports, require) => {
+// A copy of the site's data kept in your Telegram chat with the bot: one pinned
+// file, replaced quietly every 10 minutes (no new messages, no notifications).
+// It needs only the Telegram key the site already has.
+const zlib = require('node:zlib');
+
+const NAME = 'halal-site-data.json.gz';
+
+async function call(net, config, method, body) {
+  const isForm = typeof FormData !== 'undefined' && body instanceof FormData;
+  const response = await net.request(`https://api.telegram.org/bot${config.telegram.token}/${method}`, {
+    method: 'POST',
+    body,
+    timeout: 60000,
+    retries: 1,
+    headers: isForm ? {} : { 'content-type': 'application/json' },
+  });
+  let data = {};
+  try { data = await response.json(); } catch { /* not JSON */ }
+  if (!data.ok) throw new Error(`Telegram ${method}: ${data.description ?? `answered ${response.status}`}`);
+  return data.result;
+}
+
+// The pinned backup, or null if there is none yet.
+async function readBackup(net, config) {
+  const chat = await call(net, config, 'getChat', JSON.stringify({ chat_id: config.telegram.chatId }));
+  const m = chat.pinned_message;
+  if (!m?.document || m.document.file_name !== NAME) return null;
+  const file = await call(net, config, 'getFile', JSON.stringify({ file_id: m.document.file_id }));
+  const response = await net.request(`https://api.telegram.org/file/bot${config.telegram.token}/${file.file_path}`, { timeout: 60000, retries: 1 });
+  if (!response.ok) throw new Error(`Telegram file download answered ${response.status}`);
+  const text = zlib.gunzipSync(Buffer.from(await response.arrayBuffer())).toString('utf8');
+  return { text, messageId: m.message_id };
+}
+
+// Replaces the pinned file (or sends and pins it the first time). Returns its message id.
+async function writeBackup(net, config, json, messageId) {
+  const gz = zlib.gzipSync(json);
+  const caption = `🗄 Site data backup, saved ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC. Keep this pinned: the site reloads it after a restart.`;
+  const file = () => new Blob([gz], { type: 'application/gzip' });
+  if (messageId) {
+    const form = new FormData();
+    form.append('chat_id', String(config.telegram.chatId));
+    form.append('message_id', String(messageId));
+    form.append('media', JSON.stringify({ type: 'document', media: 'attach://file', caption }));
+    form.append('file', file(), NAME);
+    try {
+      await call(net, config, 'editMessageMedia', form);
+      return messageId;
+    } catch (error) {
+      // Deleted or too old to edit: start a new pinned file below.
+      if (!/not found|can't be edited|message_id_invalid|message to edit/i.test(error.message)) throw error;
+    }
+  }
+  const form = new FormData();
+  form.append('chat_id', String(config.telegram.chatId));
+  form.append('document', file(), NAME);
+  form.append('caption', caption);
+  form.append('disable_notification', 'true');
+  const message = await call(net, config, 'sendDocument', form);
+  await call(net, config, 'pinChatMessage', JSON.stringify({ chat_id: config.telegram.chatId, message_id: message.message_id, disable_notification: true }));
+  return message.message_id;
+}
+
+module.exports = { readBackup, writeBackup, NAME };
 
 };
 
