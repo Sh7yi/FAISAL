@@ -840,6 +840,8 @@ function loadConfig(env = process.env) {
     newsSeconds: num(env.NEWS_SECONDS, 60),
     runCollector: env.RUN_COLLECTOR !== 'false',
     assetVersion: (env.RENDER_GIT_COMMIT || 'dev').slice(0, 8),
+    // The site's design: a, b, c, d, e or classic. Chosen design: d (Pixel sunset).
+    theme: ['a', 'b', 'c', 'd', 'e', 'classic'].includes(String(env.THEME ?? '').toLowerCase()) ? String(env.THEME).toLowerCase() : 'd',
     zoya: {
       key: zoyaRaw,
       // The key is sent with its environment in front, "live-" or "sandbox-".
@@ -2220,6 +2222,8 @@ const mixin = {
 
   // ---------- Reddit buzz (bonus point only) ----------
   async pollBuzz() {
+    // Right after a restart the stock list may not be loaded yet: try again next round.
+    if (!this.state.universe.symbols.length) return;
     try {
       const map = await redditBuzz(this.net);
       const uni = this.universeSet();
@@ -3248,6 +3252,7 @@ const pages = require('./views/pages');
 const pages2 = require('./views/pages2');
 const { CSS, JS, FAVICON, manifest, serviceWorker, OFFLINE } = require('./views/assets');
 const ART = require('./views/art');
+const { themeCss } = require('./views/themes');
 
 // Pictures are kept in memory once, decoded from the bundle.
 const IMAGES = {
@@ -3385,7 +3390,7 @@ function createServer(engine) {
       const secure = (req.headers['x-forwarded-proto'] ?? '').includes('https');
 
       // Public bits: assets, robots, a tiny health check.
-      if (path === '/app.css') return send(res, 200, CSS, 'text/css; charset=utf-8');
+      if (path === '/app.css') return send(res, 200, CSS + themeCss(config.theme), 'text/css; charset=utf-8');
       if (path === '/app.js') return send(res, 200, JS, 'application/javascript; charset=utf-8');
       if (path === '/favicon.svg') return send(res, 200, FAVICON, 'image/svg+xml');
       if (IMAGES[path]) return send(res, 200, image(path), IMAGES[path][0]);
@@ -4717,8 +4722,8 @@ function manifest(config) {
     start_url: '/',
     scope: '/',
     display: 'standalone',
-    background_color: '#0c1511',
-    theme_color: '#0c1511',
+    background_color: config.theme === 'd' ? '#1d1838' : '#0c1511',
+    theme_color: config.theme === 'd' ? '#1d1838' : '#0c1511',
     icons: [
       { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
       { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
@@ -4890,6 +4895,7 @@ const { chartSvg, intradaySvg } = require('./chart');
 const { vwapOf } = require('../analysis/scalp');
 const { bestSignals } = require('../analysis/rank');
 const { tipFor } = require('../analysis/tips');
+const THEME_COLOR = { a: '#070d1c', b: '#000000', c: '#fff1e5', d: '#1d1838', e: '#eef3f0', classic: '#0c1511' };
 
 const NAV = [
   ['/', 'Signals'],
@@ -4909,7 +4915,7 @@ function layout({ title, active = '/', body, config, version = '', live = '' }) 
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="robots" content="noindex,nofollow">
-<meta name="theme-color" content="#0c1511">
+<meta name="theme-color" content="${THEME_COLOR[config.theme] ?? '#0c1511'}">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="${config.siteName}">
@@ -5700,6 +5706,234 @@ ${bt.recent.map((e) => html`<tr><td><a href="/s/${encodeURIComponent(e.symbol)}"
 }
 
 module.exports = { eventsPage, paperPage, moneyPage, backtestPage, curveSvg, GRAMS_PER_OUNCE };
+
+};
+
+// ---------- views/themes.js ----------
+__defs["views/themes"] = (module, exports, require) => {
+// Whole-site designs. Each is laid over the base stylesheet: colours, type,
+// shapes, backgrounds and the chart. Pick one with the THEME setting.
+
+const geo = encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><g fill="none" stroke="#d4af37" stroke-opacity=".07" stroke-width="1"><path d="M32 6l7.5 18.5L58 32l-18.5 7.5L32 58l-7.5-18.5L6 32l18.5-7.5z"/><path d="M13.6 13.6l18.4 7.6 18.4-7.6-7.6 18.4 7.6 18.4-18.4-7.6-18.4 7.6 7.6-18.4z"/></g></svg>`);
+
+const THEMES = {
+  classic: { name: 'Old money', css: '' },
+
+  // A: Arabian night — midnight blue, gold geometry, serif.
+  a: {
+    name: 'Midnight & gold',
+    css: `
+:root{--bg:#070d1c;--bg2:#0b1428;--card:#0f1a33;--card2:#14223f;--inset:#0b1530;--line:#1e2c4d;--line2:#2b3c64;
+--brass:#d4af37;--brass2:#f0d77a;--brass-bg:#2a2410;--brass-line:#6b5a22;--text:#f4efe1;--muted:#b9b29c;--dim:#7c7d8a;
+--good:#2fbf8a;--good-bg:#0e3a2d;--good-line:#1f6b52;--good-text:#86e3bd;--bad:#e0556b;--bad-bg:#3c1420;--bad-line:#6e2537;--bad-text:#f4a7b4;
+--camel:#e0a84a;--camel-bg:#3a2a10;--camel-line:#76551e;--camel-text:#f3cf8b;--navy:#6c8ed8;--navy-bg:#132447;--navy-line:#2a4378;--navy-text:#bccdf3;--radius:18px}
+body{background:url("data:image/svg+xml,${geo}"),radial-gradient(900px 500px at 50% -10%,#16264a 0%,transparent 70%),var(--bg)}
+header.top{background:rgba(7,13,28,.86);border-bottom:1px solid var(--brass-line)}
+.card{border-radius:20px;border-top:2px solid var(--brass-line)}
+.card.sotd{border:1px solid var(--brass);border-top:3px solid var(--brass)}
+.ribbon{background:linear-gradient(135deg,#f0d77a,#b8902a);color:#1a1405}
+.verdict.buy{background:linear-gradient(135deg,#1f8f66,#0f5a40);color:#fff;border-color:var(--brass)}
+.verdict.wait{background:linear-gradient(135deg,#a8741f,#6b4812);color:#fff6e0;border-color:#c9973f}
+.verdict.break{background:linear-gradient(135deg,#3456a8,#1c3168);color:#e8eeff;border-color:#5677c9}
+.verdict.watch{background:#18264a;color:#d9d6cc;border-color:var(--line2)}
+.verdict.avoid{background:linear-gradient(135deg,#9a2a3e,#5c1424);color:#ffe5ea;border-color:#c4475d}
+.frame{background:linear-gradient(135deg,#f6e3a1,#b8902a 40%,#f0d77a 60%,#8a6a1c);border-radius:999px 999px 14px 14px;padding:8px}
+.frame img{border-radius:999px 999px 8px 8px}
+.hero{background:linear-gradient(160deg,rgba(212,175,55,.10),rgba(15,26,51,.92) 40%,rgba(11,21,48,.95));border-color:var(--brass-line)}
+button,.btn{background:linear-gradient(135deg,#1f8f66,#0f5a40);border-color:var(--brass)}
+.chart,.curve{background:#08112a}
+.tg.na i,.ten .na .ico{background:#18264a}
+`,
+  },
+
+  // B: modern trading app — black, neon green, big bold numbers.
+  b: {
+    name: 'Neon trader',
+    css: `
+:root{--bg:#000;--bg2:#050505;--card:#0d0e10;--card2:#111316;--inset:#16181c;--line:#1c1f24;--line2:#2a2e35;
+--brass:#00e676;--brass2:#5cffaa;--brass-bg:#04261a;--brass-line:#0d5a39;--text:#fff;--muted:#9aa0a6;--dim:#6b7076;
+--good:#00e676;--good-bg:#03291b;--good-line:#0d5a39;--good-text:#4dff9e;--bad:#ff4d4f;--bad-bg:#2e0b0c;--bad-line:#6b1a1c;--bad-text:#ff8a8c;
+--camel:#ffb020;--camel-bg:#2e2006;--camel-line:#6b4a0c;--camel-text:#ffc95c;--navy:#4da3ff;--navy-bg:#0a1f38;--navy-line:#16406e;--navy-text:#9cc9ff;
+--serif:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--radius:22px;--shadow:none}
+body{background:#000}
+header.top{background:rgba(0,0,0,.85);border-bottom:1px solid #15171a}
+.logo{border:2px solid var(--good);box-shadow:none}
+nav.tabs a.on{background:#fff;color:#000;border-color:#fff}
+h1,h2,h3{font-weight:800;letter-spacing:-.4px}
+h1{font-size:32px} h2::after{display:none}
+.kicker,.bubble .k,.stat .k,table.list th,.form-grid label{color:var(--muted)}
+.bubble .v{font-size:28px;font-weight:800}
+.card,.bubble{border:0;background:var(--card)}
+.card.buy{box-shadow:inset 0 0 0 1px rgba(0,230,118,.25)}
+.card.sotd{box-shadow:inset 0 0 0 2px var(--good),0 0 40px rgba(0,230,118,.12)}
+.ribbon{background:var(--good);color:#00140a}
+.tick{background:transparent;border:0;padding:0;font-size:26px;font-weight:900}
+.px .p{font-size:26px;font-weight:800}
+.verdict{border:0;letter-spacing:.4px}
+.verdict.buy{background:var(--good);color:#00140a}
+.verdict.wait{background:var(--camel);color:#1f1400}
+.verdict.break{background:var(--navy);color:#00152b}
+.verdict.watch{background:#24272c;color:#e6e6e6}
+.verdict.avoid{background:var(--bad);color:#fff}
+.frame{background:conic-gradient(from 200deg,#00e676,#00b0ff,#00e676);padding:3px;border-radius:24px;box-shadow:0 0 30px rgba(0,230,118,.25)}
+.frame img{border:0;border-radius:21px}
+.hero{background:radial-gradient(500px 220px at 85% 0%,rgba(0,230,118,.16),transparent 70%),#0b0c0e;border:0}
+.hero .hello{font-family:system-ui;font-style:normal;color:var(--muted)}
+button,.btn{background:#fff;color:#000;border:0;font-weight:800}
+button.ghost{background:transparent;color:var(--muted);border:1px solid var(--line2)}
+.tip{background:#0b1d14;border-color:#0d3a26}.tip b{color:var(--good)}
+.chart,.curve{background:#050506;border-color:#15171a}
+.chart .body.up,.chart .vol.up{fill:#00e676}.chart .body.dn,.chart .vol.dn{fill:#ff4d4f}.chart .wick.up{stroke:#00e676}.chart .wick.dn{stroke:#ff4d4f}
+.chart .ma20{stroke:#ffffff}.chart .ma50{stroke:#4da3ff}.legend .lg-ma20{background:#fff}.legend .lg-ma50{background:#4da3ff}
+.tg.na i,.ten .na .ico{background:#1c1f24}
+`,
+  },
+
+  // C: financial newspaper — salmon paper, black serif, claret.
+  c: {
+    name: 'Financial paper',
+    css: `
+:root{--bg:#fff1e5;--bg2:#fbe6d4;--card:#fff7ef;--card2:#fffaf5;--inset:#fbeadc;--line:#e6cdb8;--line2:#d4b59b;
+--brass:#990f3d;--brass2:#990f3d;--brass-bg:#f6dcd9;--brass-line:#d9a3ad;--text:#33302e;--muted:#66605c;--dim:#8f8781;
+--good:#0d7680;--good-bg:#d8eef0;--good-line:#9ccfd3;--good-text:#0a5e66;--bad:#cc0000;--bad-bg:#f9dede;--bad-line:#e9a9a9;--bad-text:#a30000;
+--camel:#b36b00;--camel-bg:#fbe9cc;--camel-line:#e3bf86;--camel-text:#8a5200;--navy:#0f5499;--navy-bg:#dde8f5;--navy-line:#a9c3e3;--navy-text:#0f5499;
+--serif:Georgia,"Times New Roman",serif;--radius:4px;--shadow:none}
+html,body{font-family:Georgia,"Times New Roman",serif;color:var(--text)}
+body{background:var(--bg)}
+a{color:#0f5499}
+header.top{background:rgba(255,241,229,.95);border-bottom:2px solid #33302e}
+.brand{color:#33302e;font-weight:700}
+.logo{border:1px solid #33302e;box-shadow:none;border-radius:50%}
+nav.tabs a{color:#66605c;border-radius:0}
+nav.tabs a.on{background:transparent;color:#33302e;border:0;border-bottom:3px solid #990f3d}
+h1{font-size:32px;font-weight:700}
+h2{font-size:15px;text-transform:uppercase;letter-spacing:2px;border-top:2px solid #33302e;padding-top:8px}
+h2::after{display:none}
+.card,.bubble,.hero,table.list td,.news-row,.mini,.empty,.stat,.explain,.tip{border-radius:4px}
+.card{background:var(--card);border:1px solid var(--line);box-shadow:none}
+.card.sotd{border:1px solid #33302e;border-top:4px solid #990f3d}
+.ribbon{background:#990f3d;color:#fff;border-radius:0}
+.tick{background:transparent;border:0;border-bottom:2px solid #33302e;border-radius:0;padding:0 2px;color:#33302e}
+.chip,.filters a,.verdict,button,.btn,input,select{border-radius:3px}
+.verdict{border:0;letter-spacing:1.5px;font-size:13px}
+.verdict.buy{background:#0d7680;color:#fff}.verdict.wait{background:#b36b00;color:#fff}.verdict.break{background:#0f5499;color:#fff}
+.verdict.watch{background:#e6d6c8;color:#33302e}.verdict.avoid{background:#cc0000;color:#fff}
+.frame{background:#fff;padding:8px;border:1px solid #33302e;border-radius:0;box-shadow:none}
+.frame img{border:0;border-radius:0}
+.hero{background:var(--card2);border:1px solid var(--line)}
+.hero .hello{color:#990f3d}
+button,.btn{background:#33302e;color:#fff1e5;border:0}
+button.ghost{background:transparent;color:#33302e;border:1px solid #33302e}
+.newpill{background:#990f3d;color:#fff}
+.chart,.curve{background:#fffaf5;border-color:var(--line)}
+.chart .body.up,.chart .vol.up{fill:#0d7680}.chart .body.dn,.chart .vol.dn{fill:#cc0000}.chart .wick.up{stroke:#0d7680}.chart .wick.dn{stroke:#cc0000}
+.chart .zone.sup{fill:rgba(13,118,128,.10);stroke:rgba(13,118,128,.35)}.chart .zone.res{fill:rgba(204,0,0,.08);stroke:rgba(204,0,0,.3)}
+.chart .zone-t.sup{fill:#0a5e66}.chart .zone-t.res{fill:#a30000}.chart .last-t{fill:#33302e}
+.chart .ma20{stroke:#990f3d}.chart .ma50{stroke:#0f5499}.chart .l-entry{stroke:#33302e;fill:#33302e}
+.legend .lg-ma20{background:#990f3d}.legend .lg-ma50{background:#0f5499}.legend .lg-entry{background:#33302e}
+.curve .ln{stroke:#990f3d}.curve .ar{fill:rgba(153,15,61,.08)}.curve text{fill:#66605c}
+.tg.na i,.ten .na .ico{background:#eadbcc}
+.boom,.boom.hot,.boom.warm{background:var(--inset)}.boom.hot{background:var(--good-bg)}.boom.warm{background:var(--camel-bg)}.boom .boom-score{background:#f1e0d1}
+.chart-empty{background:#fffaf5}
+`,
+  },
+
+  // D: 8-bit game, in the colours of the pixel-art portrait.
+  d: {
+    name: 'Pixel sunset',
+    css: `
+:root{--bg:#1d1838;--bg2:#2a2350;--card:#2b2452;--card2:#342b5e;--inset:#221c44;--line:#4a3f7a;--line2:#5c4f94;
+--brass:#f2a65a;--brass2:#ffd08a;--brass-bg:#4a2f3a;--brass-line:#a0623f;--text:#fdf0d5;--muted:#c9b8e0;--dim:#8c7fb0;
+--good:#5fd38d;--good-bg:#1e4a3a;--good-line:#3d8f63;--good-text:#9cf0be;--bad:#e04f5f;--bad-bg:#5a1f33;--bad-line:#9a3348;--bad-text:#ffb0b8;
+--camel:#f2a65a;--camel-bg:#4a3322;--camel-line:#a0623f;--camel-text:#ffd08a;--navy:#7aa2ff;--navy-bg:#253366;--navy-line:#4060b0;--navy-text:#c4d4ff;
+--serif:ui-monospace,"SFMono-Regular",Menlo,Consolas,"Courier New",monospace;--radius:0;--shadow:4px 4px 0 #0e0b1f}
+html,body{font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,"Courier New",monospace;font-size:14px}
+body{background:radial-gradient(1.5px 1.5px at 12% 8%,#fff8 50%,transparent 51%),radial-gradient(1.5px 1.5px at 72% 14%,#fff6 50%,transparent 51%),radial-gradient(2px 2px at 40% 4%,#fff5 50%,transparent 51%),linear-gradient(180deg,#2e2a5c 0%,#4a3466 30%,#6b3a55 60%,#3a1a2c 100%) fixed}
+header.top{background:#1d1838;border-bottom:4px solid #0e0b1f}
+.logo{border-radius:0;border:3px solid var(--text);box-shadow:3px 3px 0 #0e0b1f;image-rendering:pixelated}
+nav.tabs a{border-radius:0;text-transform:uppercase;font-size:12px}
+nav.tabs a.on{background:var(--brass);color:#1d1838;border:0;box-shadow:3px 3px 0 #0e0b1f}
+h1,h2,h3{text-transform:uppercase;letter-spacing:1px}
+h1{font-size:22px} h2{font-size:16px} h2::after{height:4px;background:repeating-linear-gradient(90deg,var(--brass) 0 8px,transparent 8px 12px)}
+.card,.bubble,.hero,.stat,.chip,.filters a,.verdict,.tick,button,.btn,input,select,table.list td,.mini,.news-row,.empty,.tip,.explain,.boom,.tg,.ten li,.ribbon,.mover{border-radius:0 !important}
+.card,.bubble,.hero{border:3px solid #0e0b1f;box-shadow:4px 4px 0 #0e0b1f}
+.card.sotd{border-color:var(--brass);box-shadow:4px 4px 0 #0e0b1f,0 0 0 3px #0e0b1f}
+.ribbon{background:var(--brass);color:#1d1838;box-shadow:3px 3px 0 #0e0b1f}
+.tick{border:3px solid var(--text);background:#0e0b1f;color:var(--text)}
+.verdict{border:3px solid #0e0b1f;box-shadow:3px 3px 0 #0e0b1f;text-transform:uppercase}
+.verdict.buy{background:#5fd38d;color:#0e0b1f}.verdict.wait{background:#f2a65a;color:#0e0b1f}.verdict.break{background:#7aa2ff;color:#0e0b1f}
+.verdict.watch{background:#4a3f7a;color:var(--text)}.verdict.avoid{background:#e04f5f;color:#fff}
+.frame{background:#0e0b1f;padding:4px;border:4px solid var(--text);border-radius:0;box-shadow:6px 6px 0 #0e0b1f}
+.frame img{border:0;border-radius:0}
+.hero{background:linear-gradient(180deg,#342b5e,#4a2f4f)}
+.hero .hello{font-style:normal;color:var(--brass)}
+button,.btn{background:var(--good);color:#0e0b1f;border:3px solid #0e0b1f;box-shadow:3px 3px 0 #0e0b1f;text-transform:uppercase}
+button.ghost{background:var(--card2);color:var(--text)}
+.newpill{border-radius:0;background:var(--brass);color:#1d1838}
+.chart,.curve{background:#1a1533;border:3px solid #0e0b1f;border-radius:0;image-rendering:pixelated}
+.chart .body.up,.chart .vol.up{fill:#5fd38d}.chart .body.dn,.chart .vol.dn{fill:#e04f5f}.chart .wick.up{stroke:#5fd38d}.chart .wick.dn{stroke:#e04f5f}
+.chart .ma20{stroke:#f2a65a}.chart .ma50{stroke:#7aa2ff}.legend .lg-ma20{background:#f2a65a}.legend .lg-ma50{background:#7aa2ff}
+.tg.na i,.ten .na .ico{background:#3a3270}
+.ten .ico,.tg i{border-radius:0 !important}
+`,
+  },
+
+  // E: light and bubbly — white cards, soft shadows, rounded everything.
+  e: {
+    name: 'Soft & bubbly',
+    css: `
+:root{--bg:#eef3f0;--bg2:#e6eee9;--card:#fff;--card2:#fff;--inset:#f3f7f4;--line:#e2e9e4;--line2:#d3ddd6;
+--brass:#1f7a4d;--brass2:#17663f;--brass-bg:#e1f3e8;--brass-line:#b7dfc7;--text:#14261c;--muted:#5b6b62;--dim:#8a978f;
+--good:#1f9d5c;--good-bg:#e1f5e9;--good-line:#b5e3c8;--good-text:#147a45;--bad:#e5484d;--bad-bg:#fde8e8;--bad-line:#f6c1c3;--bad-text:#c62f35;
+--camel:#e8913a;--camel-bg:#fdf0e1;--camel-line:#f3cfa3;--camel-text:#b4661a;--navy:#3e63dd;--navy-bg:#e6edfd;--navy-line:#bccbf6;--navy-text:#3451b2;
+--serif:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI",system-ui,sans-serif;--radius:26px;--shadow:0 10px 30px rgba(20,38,28,.08)}
+html,body{font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI",system-ui,sans-serif;color:var(--text)}
+body{background:radial-gradient(700px 400px at 0% 0%,#dff3e7 0%,transparent 60%),radial-gradient(600px 400px at 100% 0%,#fde9ea 0%,transparent 60%),var(--bg)}
+a{color:#1f7a4d}
+header.top{background:rgba(255,255,255,.8);border-bottom:1px solid var(--line)}
+.brand{color:var(--text)}
+.logo{border:3px solid #fff;box-shadow:0 4px 12px rgba(20,38,28,.18)}
+nav.tabs a.on{background:var(--text);color:#fff;border-color:var(--text)}
+h1,h2,h3{font-weight:800;letter-spacing:-.3px}
+h2::after{display:none}
+.card{border:0;border-radius:30px;background:#fff}
+.bubble{border:0;background:#fff}
+.card.buy{box-shadow:0 10px 30px rgba(31,157,92,.14)}
+.card.avoid{box-shadow:0 10px 30px rgba(229,72,77,.12)}
+.card.sotd{box-shadow:0 0 0 3px #1f9d5c,0 16px 40px rgba(31,157,92,.2)}
+.ribbon{background:linear-gradient(135deg,#ffd166,#f4a259);color:#3b2400}
+.tick{background:var(--inset);border:0;border-radius:16px}
+.verdict{border:0;box-shadow:0 6px 16px rgba(0,0,0,.08)}
+.verdict.buy{background:#1f9d5c;color:#fff}.verdict.wait{background:#e8913a;color:#fff}.verdict.break{background:#3e63dd;color:#fff}
+.verdict.watch{background:#e9efeb;color:#3c4a42}.verdict.avoid{background:#e5484d;color:#fff}
+.frame{background:#fff;padding:6px;border-radius:28px;box-shadow:0 12px 30px rgba(20,38,28,.18)}
+.frame img{border:0;border-radius:22px}
+.hero{background:linear-gradient(135deg,#ffffff,#f3faf6);border:0;border-radius:32px}
+.hero .hello{font-family:inherit;font-style:normal;color:#1f7a4d}
+.stat,.tg,.ten li,.mini,.news-row,.explain,.boom{border:0;background:var(--inset)}
+button,.btn{background:#1f9d5c;color:#fff;border:0;box-shadow:0 8px 20px rgba(31,157,92,.3)}
+button.ghost{background:#fff;color:var(--muted);border:1px solid var(--line2);box-shadow:none}
+.newpill{background:#14261c;color:#fff}
+.tip{background:#fff8e6;border:0}.tip b{color:#b4661a}
+.chart,.curve{background:#fbfdfc;border:1px solid var(--line)}
+.chart .body.up,.chart .vol.up{fill:#1f9d5c}.chart .body.dn,.chart .vol.dn{fill:#e5484d}.chart .wick.up{stroke:#1f9d5c}.chart .wick.dn{stroke:#e5484d}
+.chart .zone.sup{fill:rgba(31,157,92,.10);stroke:rgba(31,157,92,.3)}.chart .zone.res{fill:rgba(229,72,77,.08);stroke:rgba(229,72,77,.3)}
+.chart .zone-t.sup{fill:#147a45}.chart .zone-t.res{fill:#c62f35}.chart .last-t{fill:#14261c}
+.chart .ma20{stroke:#e8913a}.chart .ma50{stroke:#3e63dd}.chart .l-entry{stroke:#14261c;fill:#14261c}
+.legend .lg-ma20{background:#e8913a}.legend .lg-ma50{background:#3e63dd}.legend .lg-entry{background:#14261c}
+.curve .ln{stroke:#1f9d5c}.curve .ar{fill:rgba(31,157,92,.1)}.curve text{fill:#5b6b62}
+.tg.na i,.ten .na .ico{background:#e3e9e5}
+.boom.hot{background:var(--good-bg)}.boom.warm{background:var(--camel-bg)}.boom .boom-score{background:#fff}
+.chart-empty{background:#fbfdfc}
+`,
+  },
+};
+
+function themeCss(key) {
+  return (THEMES[key] ?? THEMES.classic).css;
+}
+
+module.exports = { THEMES, themeCss };
 
 };
 
