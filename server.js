@@ -891,6 +891,8 @@ function loadConfig(env = process.env) {
       floatMax: num(env.SCALP_FLOAT_MAX, 20e6),
       primeMinutes: num(env.SCALP_PRIME_MINUTES, 60), // no BUY NOW after 10:30 New York
       maxStopsPerDay: num(env.SCALP_MAX_STOPS, 2),
+      // auto = Telegram scalp alerts only while some penny rule makes money in the penny lab.
+      alertsMode: ['on', 'off', 'auto'].includes(String(env.SCALP_ALERTS).toLowerCase()) ? String(env.SCALP_ALERTS).toLowerCase() : 'auto',
       maxAboveVwap: num(env.SCALP_MAX_ABOVE_VWAP, 0.12),
       maxStop: num(env.SCALP_MAX_STOP, 0.06),
       t1: num(env.SCALP_TARGET1, 0.05),
@@ -2108,7 +2110,8 @@ class Engine {
           s.scalp.alerts = s.scalp.alerts.slice(0, 300);
           this.paperOpen({ kind: 'scalp', ref: alert.id, symbol: sym, price: check.price, levels: check.levels, now });
           this.dirty = true;
-          try {
+          alert.silent = !this.pennyAlertsOn();
+          if (!alert.silent) try {
             await sendTelegram(this.net, this.config, scalpAlertText({ symbol: sym, name: intra.name, ...check }, this.config));
             this.net.mark('Telegram alerts', true, `scalp: ${sym}`);
           } catch (error) {
@@ -2174,6 +2177,20 @@ class Engine {
     const pos = (x) => x?.n >= 15 && x.avg > 0;
     const worse = (x) => !x?.n || x.avg < 0;
     return pb && pos(pb.inSample) && pos(pb.outSample) && worse(hod?.outSample) ? 'pullback' : 'breakout';
+  }
+
+  // Telegram scalp alerts: on while at least one penny rule made money in both years of the
+  // penny lab (after spreads); paused while every rule lost. Paper trading keeps testing either way.
+  pennyAlertsOn() {
+    const mode = this.config.scalp.alertsMode;
+    if (mode === 'on') return true;
+    if (mode === 'off') return false;
+    const pl = this.state.pennyLab;
+    if (!pl?.grid) return true; // no lab result yet
+    const ok = (x) => x?.n >= 10 && x.avg > 0;
+    const rule = this.scalpRule();
+    const cell = rule === 'pullback' ? pl.grid.vwap_pb?.vwap : pl.grid.hod120?.site;
+    return Boolean(ok(cell?.inSample) && ok(cell?.outSample));
   }
 
   // Late-morning breakouts are allowed only if the penny lab shows they make money.
@@ -3422,7 +3439,7 @@ const mixin = {
   learn(now = new Date()) {
     const s = this.state;
     const today = dayKey(now);
-    if (s.learn?.day === today) return;
+    if (s.learn?.day === today && s.learn?.newsLabAt === (s.newsLab?.at ?? null)) return;
     const done = s.signals.filter((x) => x.outcome?.done && x.catalyst);
     const byCatalyst = {};
     const groups = {};
@@ -3439,9 +3456,21 @@ const mixin = {
       const win = scalps.filter((a) => ['half', 'both'].includes(a.result.outcome)).length / scalps.length;
       scalpBump = win < 0.25 ? 2 : win < 0.35 ? 1 : win > 0.6 ? -1 : 0;
     }
+    // Two years of headlines from the news lab count too: a kind of news that lost against the
+    // market in both years needs a stronger score; one that clearly lost (t ≤ −2 over 100+
+    // trades) needs a perfect 10.
+    for (const b of s.newsLab?.byCatalyst ?? []) {
+      const all = b.all ?? {}; const un = b.unseen ?? {};
+      let labAdj = 0;
+      if (all.n >= 100 && all.avgAdj < 0 && all.t <= -2) labAdj = 2;
+      else if (all.n >= 30 && un.n >= 30 && all.avgAdj < 0 && un.avgAdj < 0) labAdj = 1;
+      const cur = byCatalyst[b.key] ?? { n: 0, hit: null, avg: null, adj: 0 };
+      if (labAdj > (cur.adj ?? 0)) byCatalyst[b.key] = { ...cur, adj: labAdj, fromLab: { n: all.n, avgAdj: all.avgAdj, t: all.t }, minImpact: this.minImpactFor(b.key, labAdj) };
+      else if (cur.n || labAdj) byCatalyst[b.key] = { ...cur, lab: { n: all.n, avgAdj: all.avgAdj, t: all.t } };
+    }
     const before = s.learn?.byCatalyst ?? {};
     const changes = Object.entries(byCatalyst).filter(([cat, v]) => (before[cat]?.adj ?? 0) !== v.adj).map(([cat, v]) => ({ cat, from: (before[cat]?.adj ?? 0), to: v.adj, at: now.toISOString() }));
-    s.learn = { day: today, updatedAt: now.toISOString(), byCatalyst, scalpBump, scalpSamples: scalps.length, changes: [...changes, ...(s.learn?.changes ?? [])].slice(0, 40) };
+    s.learn = { day: today, newsLabAt: s.newsLab?.at ?? null, updatedAt: now.toISOString(), byCatalyst, scalpBump, scalpSamples: scalps.length, changes: [...changes, ...(s.learn?.changes ?? [])].slice(0, 40) };
     this.touch();
   },
 
@@ -7144,11 +7173,11 @@ function moneyBoth(usd, config) {
 
 function learnBox(engine) {
   const { state, config } = engine;
-  const rows = Object.entries(state.learn?.byCatalyst ?? {}).sort((a, b) => b[1].n - a[1].n);
+  const rows = Object.entries(state.learn?.byCatalyst ?? {}).sort((a, b) => (b[1].adj ?? 0) - (a[1].adj ?? 0) || b[1].n - a[1].n);
   return html`<h2>What the site learned</h2>
 <p class="section-note">Once a day each kind of news is checked against its real results. When a kind keeps failing, the site asks for stronger news of that kind; when it keeps working, the bar comes down a little. It needs at least 30 finished signals of a kind before it changes anything (fewer is mostly luck), and even then each kind is pulled towards the average of all news so one streak can't swing it.</p>
 ${rows.length ? html`<div class="scroll"><table class="list"><tr><th>Kind of news</th><th>Finished signals</th><th>Reached +${Math.round(config.halfGain * 100)}%</th><th>Avg trade</th><th>Impact needed</th></tr>
-${rows.map(([cat, v]) => html`<tr class="${v.n < 30 ? 'dim' : ''}"><td><b>${CATALYSTS[cat]?.label ?? cat}</b>${v.n < 30 ? html`<br><span class="small">too few to judge</span>` : ''}</td><td>${v.n}</td><td>${pct(v.rawHit ?? v.hit, 0, false)}${v.range ? html`<span class="dim small"> (${Math.round(v.range[0] * 100)}–${Math.round(v.range[1] * 100)}%)</span>` : ''}</td><td>${changeSpan(v.rawAvg ?? v.avg)}</td><td><span class="chip ${v.adj > 0 ? 'r' : v.adj < 0 ? 'g' : ''}">${engine.minImpactFor(cat)}+/10${v.adj > 0 ? ' (raised)' : v.adj < 0 ? ' (lowered)' : ''}</span></td></tr>`)}</table></div>`
+${rows.map(([cat, v]) => html`<tr class="${v.n < 30 && !v.fromLab ? 'dim' : ''}"><td><b>${CATALYSTS[cat]?.label ?? cat}</b>${v.fromLab ? html`<br><span class="small">news lab: ${pct(v.fromLab.avgAdj, 1)} vs market over ${v.fromLab.n} past trades</span>` : v.n < 30 ? html`<br><span class="small">too few to judge</span>` : ''}</td><td>${v.n}</td><td>${v.n ? html`${pct(v.rawHit ?? v.hit, 0, false)}${v.range ? html`<span class="dim small"> (${Math.round(v.range[0] * 100)}–${Math.round(v.range[1] * 100)}%)</span>` : ''}` : '–'}</td><td>${v.n ? changeSpan(v.rawAvg ?? v.avg) : '–'}</td><td><span class="chip ${v.adj > 0 ? 'r' : v.adj < 0 ? 'g' : ''}">${engine.minImpactFor(cat)}+/10${v.adj > 0 ? ' (raised)' : v.adj < 0 ? ' (lowered)' : ''}</span></td></tr>`)}</table></div>`
     : html`<div class="empty">Nothing learned yet — it starts after the first signals finish their 10 days.</div>`}
 <p class="small muted">Penny scalps: alerts need a score of <b>${engine.scalpAlertScore()}/10</b>${state.learn?.scalpBump ? ` (moved by ${state.learn.scalpBump > 0 ? '+' : ''}${state.learn.scalpBump} after ${state.learn.scalpSamples} results)` : ''}.</p>`;
 }
@@ -7323,6 +7352,7 @@ function pennyPage({ engine, part = false }) {
   const share = (o) => (scored.length ? scored.filter((a) => (Array.isArray(o) ? o.includes(a.result.outcome) : a.result.outcome === o)).length / scored.length : null);
   const body = html`<h1>Penny scalps</h1>
 <p class="sub">Halal penny stocks (${money(sc.minPrice)}–${money(sc.maxPrice)}, Zoya COMPLIANT, real shares on XTB) checked every minute on the 1-minute chart. Scalps last minutes to a few hours. Telegram alerts only for <b>BUY NOW with a score of ${engine.scalpAlertScore()}/10 or more</b>, at most <b>${sc.alertsPerDay} a day</b>, plus halts on stocks that are up.</p>
+${engine.pennyAlertsOn() ? '' : html`<div class="bubble bad"><h3>Telegram scalp alerts are paused</h3><p class="small">In the <a href="/backtest">penny lab</a> (every 30%+ gap day of the last two years, replayed minute by minute) the site's scalp rule lost money in both years after spreads${state.pennyLab?.grid?.hod120?.site?.outSample?.n ? html` (${changeSpan(state.pennyLab.grid.hod120.site.outSample.avg)} a trade on the unseen year)` : ''}. The page still shows the gappers and paper trading keeps testing BUY NOW calls. Alerts come back by themselves when a rule makes money in both years.</p></div>`}
 <div class="bubbles">
 <div class="bubble"><div class="k">Penny stocks watched</div><div class="v">${engine.pennyList().length}</div><div class="small muted">halal, on XTB, under ${money(sc.maxPrice)}</div></div>
 <div class="bubble"><div class="k">US market</div><div class="v">${{ open: 'Open', pre: 'Pre-market', post: 'After hours', closed: 'Closed' }[marketState()]}</div><div class="small muted">Opens ${openInDubai()} Dubai</div></div>
@@ -7647,6 +7677,15 @@ function labPage({ engine }) {
   const cards = Object.entries(results).sort(([, a], [, b]) => (order[a.verdict?.key] ?? 9) - (order[b.verdict?.key] ?? 9));
   const body = html`<h1>Strategy lab</h1>
 <p class="sub">An honest test of every setup the site uses, on two years of daily charts for the whole halal list. The exit for each setup is chosen on the <b>first year</b>; only the <b>second year</b>, which it has never seen, decides if the setup is switched on.</p>
+${(() => {
+    const nl = engine.state.newsLab; const raised = Object.entries(engine.state.learn?.byCatalyst ?? {}).filter(([, v]) => v.fromLab);
+    if (!lab && !nl && !pl) return '';
+    return html`<div class="bubble"><h3>What the lab found</h3><ul class="small">
+${nl?.outSample?.n ? html`<li><b>News signals:</b> ${sig(nl.outSample.avgAdj)} vs the market a trade on the unseen year (${nl.outSample.n} trades). ${raised.length ? html`The bar was raised for news that lost in both years: ${raised.map(([k, v]) => html`<span class="chip r">${k.replace(/_/g, ' ')} → ${v.minImpact ?? engine.minImpactFor(k)}/10</span> `)}` : ''}</li>` : ''}
+${pl?.grid ? html`<li><b>Penny scalps:</b> ${engine.pennyAlertsOn() ? 'Telegram alerts on.' : 'every rule lost in both years after spreads, so Telegram scalp alerts are paused (paper trading keeps testing).'}</li>` : ''}
+${lab ? html`<li><b>Chart and smart-money setups:</b> ${proven.length ? `${proven.length} proven` : 'none proven on the unseen year yet'}; patterns that clearly lost now show as ⚠ warnings on signals.</li>` : ''}
+</ul></div>`;
+  })()}
 <div class="bubble"><h3>Why the old backtest showed −0.16%</h3><p class="small">It bought <b>every</b> 8%+ gap on heavy volume at that day's close, with one fixed exit and a currency fee charged even on dollar stocks. Most gaps that size are already priced in by the close, so it was a coin flip minus costs. The lab below keeps that as a yardstick ("Any gap up") and tests the setups that have real evidence behind them instead — fairly, with the costs you actually pay.</p></div>
 <details class="bubble"><summary><b>How the lab stays honest</b></summary><ul class="small">
 <li>A setup is only known at the close, so every trade is bought at the <b>next day's open</b>.</li>
