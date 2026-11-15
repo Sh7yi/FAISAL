@@ -1205,9 +1205,10 @@ class Engine {
         s.xtb = { symbols: [...new Set([...list.symbols, ...this.config.xtb.extra])], updatedAt: new Date().toISOString(), source: list.source, branch: list.branch ?? null };
         if (list.intl?.length) {
           const it = this.intlState();
-          it.list = list.intl;
+          // Keep the Yahoo symbol that worked last time (Frankfurt ".F" instead of ".DE").
+          it.list = list.intl.map((x) => (it.alias[x.symbol] ? { ...x, symbol: it.alias[x.symbol] } : x));
           it.updatedAt = s.xtb.updatedAt;
-          const keep = new Set(list.intl.map((x) => x.symbol));
+          const keep = new Set(it.list.map((x) => x.symbol));
           for (const sym of Object.keys(it.screens)) if (!keep.has(sym)) delete it.screens[sym];
         }
         this.net.mark('XTB stock list', true, `${s.xtb.symbols.length} US + ${list.intl?.length ?? 0} other real shares (${list.source})`);
@@ -2530,6 +2531,7 @@ const mixin = {
   intlState() {
     const s = this.state;
     if (!s.intl) s.intl = { list: [], updatedAt: null, screens: {}, newsCursor: 0 };
+    s.intl.alias ??= {};
     return s.intl;
   },
 
@@ -2562,12 +2564,25 @@ const mixin = {
     if (!it.list.length) return;
     const due = it.list.filter((x) => {
       const sc = it.screens[x.symbol];
-      return !sc || now - Date.parse(sc.at) > (sc.status === 'ERROR' ? 6 * HOUR : RESCREEN);
+      // Errors and "nothing found at all" are retried sooner than real results.
+      const empty = sc?.status === 'ERROR' || (sc?.status === 'UNKNOWN' && (sc.checks ?? []).every((c) => c.status === 'na') && !sc.retried);
+      return !sc || now - Date.parse(sc.at) > (empty ? 6 * HOUR : RESCREEN) || (empty && !sc.retried && sc.at < '2026-11-15T13');
     }).slice(0, batch);
     let ok = 0; let failedFetch = 0;
     for (const x of due) {
       try {
-        const [prof, fin, q] = [await profile(this.net, x.symbol).catch(() => null), await financials(this.net, x.symbol, now), await this.getQuote(x.symbol, 6 * HOUR)];
+        let [prof, fin, q] = [await profile(this.net, x.symbol).catch(() => null), await financials(this.net, x.symbol, now), await this.getQuote(x.symbol, 6 * HOUR)];
+        // German stocks listed only in Frankfurt are under ".F" on Yahoo, not ".DE" (Xetra).
+        if (/\.DE$/.test(x.symbol) && !prof && !fin.found) {
+          const alt = x.symbol.replace(/\.DE$/, '.F');
+          const [p2, f2] = [await profile(this.net, alt).catch(() => null), await financials(this.net, alt, now).catch(() => null)];
+          if (p2 || f2?.found) {
+            delete it.screens[x.symbol];
+            it.alias[x.symbol] = alt;
+            x.symbol = alt;
+            [prof, fin, q] = [p2, f2 ?? fin, await this.getQuote(alt, 6 * HOUR)];
+          }
+        }
         const closes = (q?.candles ?? []).map((c) => c.c).filter((v) => v > 0);
         const avgPrice = closes.length >= 60 ? closes.reduce((a, b) => a + b, 0) / closes.length : null;
         const priceCurrency = q?.currency ?? x.currency ?? null;
@@ -2579,7 +2594,8 @@ const mixin = {
         }
         const fx = (from) => rates[from] ?? NaN;
         const res = aaoifi({ prof: { ...prof, name: prof?.name ?? x.name }, fin, avgPrice, priceCurrency, fx });
-        it.screens[x.symbol] = { ...res, at: new Date(now).toISOString(), name: prof?.name ?? x.name, country: x.country };
+        const prev = it.screens[x.symbol];
+        it.screens[x.symbol] = { ...res, at: new Date(now).toISOString(), name: prof?.name ?? x.name, country: x.country, retried: Boolean(prev) };
         ok++;
       } catch (error) {
         failedFetch++;
@@ -3203,7 +3219,7 @@ function money(value, currency = CURRENCY) {
   return `${pre}${value.toFixed(digits).replace(/(\.\d{2}\d*?)0+$/, '$1')}${post}`;
 }
 // Site symbols for stocks outside the US carry Yahoo's exchange ending (VOD.L, SAP.DE).
-const INTL = /\.(L|DE|PA|MC|MI|AS|WA|LS|BR|SW|CO|ST|OL|HE|PR|VI|IR)$/;
+const INTL = /\.(L|DE|F|PA|MC|MI|AS|WA|LS|BR|SW|CO|ST|OL|HE|PR|VI|IR)$/;
 const isIntl = (symbol) => INTL.test(String(symbol));
 
 function pct(value, digits = 1, signed = true) {
