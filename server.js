@@ -454,6 +454,7 @@ function rankScore(sig, now = Date.now()) {
     + (sig.buzz?.rising ? 4 : 0)
     // A setup the strategy lab proved on unseen data, on the same stock: big buyers agree with the news.
     + ((sig.footprints ?? []).some((f) => f.on) ? 8 : 0)
+    - (sig.shorted ? 4 : 0)
     - Math.min(12, Math.max(0, hours) * 0.25);
 }
 
@@ -930,6 +931,7 @@ const sec = require('./sources/sec');
 const { earningsDates } = require('./sources/earnings');
 const insiders = require('./sources/insiders');
 const activist = require('./sources/activist');
+const finra = require('./sources/finra');
 const { ruleClassify, upgradeCheck } = require('./rules');
 const { aiClassify } = require('./ai');
 const { analyze, sma } = require('./analysis/ta');
@@ -1201,7 +1203,7 @@ class Engine {
     loop(() => this.save(), MINUTE, 'save');
     loop(() => this.fastChecks(), 5 * MINUTE, 'fast');
     loop(async () => { await this.pollInsiders(); await this.poll13D(); await this.pollFilings(); }, 10 * MINUTE, 'filings');
-    loop(async () => { await this.loadSmartHistory(); await this.maybeRunLab(); }, HOUR, 'lab');
+    loop(async () => { await this.loadShorts(); await this.loadSmartHistory(); await this.maybeRunLab(); }, HOUR, 'lab');
     loop(() => this.scanScalps(), MINUTE, 'scalp');
     loop(() => this.pollBuzz(), 15 * MINUTE, 'buzz');
     loop(() => this.scanEvents(), 30 * MINUTE, 'events');
@@ -1605,6 +1607,7 @@ class Engine {
       footprints: [...this.setupsFor(item.symbol, quote?.candles ?? [], now.getTime()).map((f) => ({ setup: f.setup, name: f.short, on: f.on, verdict: f.result?.verdict?.key ?? null })),
         ...(item.smart ? [{ setup: item.smart, name: require('./features/lab').SETUPS[item.smart]?.short ?? item.smart, on: this.labOn(item.smart), verdict: this.state.lab?.results?.[item.smart]?.verdict?.key ?? null, filing: true }] : [])],
       topBank: item.cls.topBank ?? null,
+      shorted: this.heavyShort(item.symbol),
       currency: quote?.currency ?? 'USD',
       halalBy: isIntl(item.symbol) ? 'self' : 'zoya',
       refPrice: ta?.price ?? null,
@@ -1690,8 +1693,9 @@ class Engine {
       const target = entry * (1 + this.config.targetGain);
       const riskPct = signal.levels?.riskPct ?? 0.1;
       let stop = entry * (1 - riskPct);
-      let halfDone = false; let result = null; let tradeReturn = null;
+      let halfDone = false; let result = null; let tradeReturn = null; let exitAt = window[window.length - 1].t;
       for (const c of window) {
+        exitAt = c.t;
         if (!halfDone) {
           if (c.l <= stop) { result = 'stopped'; tradeReturn = -riskPct; break; }
           if (c.h >= half) {
@@ -1708,8 +1712,20 @@ class Engine {
         if (window.length >= 10) { result = halfDone ? 'half-time' : 'time'; tradeReturn = halfDone ? (this.config.halfGain + lastC) / 2 : lastC; }
         else { result = halfDone ? 'half-open' : 'open'; tradeReturn = halfDone ? (this.config.halfGain + lastC) / 2 : lastC; }
       }
+      // The market over the same days (small caps for US stocks, Europe for the rest), so a
+      // rising market doesn't flatter the scorecard.
+      let market = null;
+      try {
+        const bq = await this.getQuote(isIntl(signal.symbol) ? '^STOXX' : 'IWM', 6 * HOUR);
+        const bc = bq?.candles ?? [];
+        const b0 = intraday ? bc.filter((c) => dayKey(c.t) <= sigDay).pop()?.c : bc.find((c) => dayKey(c.t) >= dayKey(after[0].t))?.o;
+        const b1 = bc.filter((c) => dayKey(c.t) <= dayKey(exitAt)).pop()?.c;
+        if (b0 && b1) market = b1 / b0 - 1;
+      } catch { /* no benchmark: raw result only */ }
       signal.outcome = {
         entry,
+        market,
+        vsMarket: market === null || tradeReturn === null ? null : tradeReturn - market,
         d1: ret(0), d5: ret(4), d10: ret(9),
         maxGain: Math.max(...window.map((c) => c.h)) / entry - 1,
         maxDrop: Math.min(...window.map((c) => c.l)) / entry - 1,
@@ -1909,6 +1925,32 @@ class Engine {
     } catch (error) {
       this.net.mark('Big holders (SEC 13D)', false, error.message);
     }
+  }
+
+  // FINRA daily short volume: flag the halal stocks with the heaviest short selling.
+  async loadShorts(now = new Date()) {
+    const sh = this.state.shorts;
+    if (sh?.loadedAt && now - Date.parse(sh.loadedAt) < 3 * HOUR) return;
+    try {
+      const got = await finra.latestShorts(this.net, now);
+      if (!got) throw new Error('no file in the last 6 days');
+      const set = new Set(this.state.universe.symbols.filter((x) => !isIntl(x)));
+      const map = {};
+      for (const [sym, v] of Object.entries(got.map)) if (set.has(sym) && v.total >= 50000) map[sym] = Math.round(v.ratio * 1000) / 1000;
+      const ratios = Object.values(map).sort((a, b) => a - b);
+      const cut = ratios.length ? Math.max(0.6, ratios[Math.floor(ratios.length * 0.9)]) : 0.6;
+      this.state.shorts = { loadedAt: now.toISOString(), day: got.day, cut, map };
+      this.net.mark('Short selling (FINRA)', true, `${got.day}: ${ratios.filter((r) => r >= cut).length} halal stocks with heavy shorting (${Math.round(cut * 100)}%+ of volume)`);
+      this.touch();
+    } catch (error) {
+      this.net.mark('Short selling (FINRA)', false, error.message);
+    }
+  }
+
+  heavyShort(symbol) {
+    const sh = this.state.shorts;
+    const r = sh?.map?.[symbol];
+    return r && r >= sh.cut ? { ratio: r, day: sh.day } : null;
   }
 
   // Two and a half years of insider buys and 13D filings (built weekly on GitHub) for the strategy lab.
@@ -4883,6 +4925,45 @@ module.exports = { recent8K, read8K, pressRelease, textLines };
 
 };
 
+// ---------- sources/finra.js ----------
+__defs["sources/finra"] = (module, exports, require) => {
+// FINRA's free daily short-sale volume for every US stock (published each evening).
+// Stocks with the most short selling have tended to lag the market (about 1% a month
+// for the most-shorted fifth), so heavy shorting is shown as a warning. Short selling
+// itself is not halal, so the site only ever uses this to stay out.
+const { dayKey } = require('../lib/util');
+
+function parseShortFile(text) {
+  const map = {};
+  const lines = String(text).split(/\r?\n/);
+  const head = (lines[0] || '').split('|').map((h) => h.trim().toLowerCase());
+  const iS = head.indexOf('symbol'); const iSh = head.indexOf('shortvolume'); const iT = head.indexOf('totalvolume');
+  if (iS < 0 || iSh < 0 || iT < 0) return map;
+  for (const line of lines.slice(1)) {
+    const f = line.split('|');
+    const total = Number(f[iT]); const short = Number(f[iSh]);
+    if (f[iS] && total > 0 && Number.isFinite(short)) map[f[iS].trim().toUpperCase()] = { short, total, ratio: short / total };
+  }
+  return map;
+}
+
+// The newest file: today's after about 6 p.m. New York, otherwise an earlier trading day.
+async function latestShorts(net, now = new Date()) {
+  for (let k = 0; k < 6; k++) {
+    const d = dayKey(now.getTime() - k * 864e5).replace(/-/g, '');
+    try {
+      const text = await net.text(`https://cdn.finra.org/equity/regsho/daily/CNMSshvol${d}.txt`, { timeout: 20000, retries: 0 });
+      const map = parseShortFile(text);
+      if (Object.keys(map).length > 1000) return { day: `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}`, map };
+    } catch { /* not published yet, or a holiday */ }
+  }
+  return null;
+}
+
+module.exports = { parseShortFile, latestShorts };
+
+};
+
 // ---------- sources/halts.js ----------
 __defs["sources/halts"] = (module, exports, require) => {
 // Trading halts from Nasdaq Trader (all US exchanges). The feed updates once a
@@ -5782,6 +5863,7 @@ function alertTextIn(signal, config) {
     `⚡ ${CATALYSTS[signal.catalyst]?.label ?? 'News'} · impact ${signal.impact}/10 · effect: ${signal.horizon}`,
     signal.topBank ? `🏦 Upgrade from a top bank: ${signal.topBank}` : '',
     signal.buzz?.rising ? `🔥 Reddit buzz rising: ${signal.buzz.mentions} mentions vs ${signal.buzz.prev} a day ago` : '',
+    signal.shorted ? `⚠ Heavy short selling: ${Math.round(signal.shorted.ratio * 100)}% of volume on ${signal.shorted.day} — short sellers are betting against it` : '',
     (signal.footprints ?? []).some((f) => f.on) ? `🐋 Smart money: ${(signal.footprints ?? []).filter((f) => f.on).map((f) => f.name).join(', ')} (proven in the strategy lab)` : '',
     `📋 10-point check ${signal.ten?.score ?? '?'}/10 · 💥 explosion check ${signal.explode?.score ?? '?'}/10 (${signal.explode?.label ?? ''})`,
     l ? `🎯 Entry ${money(l.entry)} · Stop ${money(l.stop)}` : '',
@@ -6430,6 +6512,7 @@ ${verdictPill(sig.verdict)}
 ${sig.atOpen ? html`<span class="chip">Moves at open</span>` : ''}
 ${sig.topBank ? html`<span class="chip b">🏦 ${sig.topBank}</span>` : ''}
 ${sig.buzz?.rising ? html`<span class="chip b" title="${sig.buzz.mentions} Reddit mentions vs ${sig.buzz.prev} a day ago">🔥 Reddit buzz rising</span>` : ''}
+${sig.shorted ? html`<span class="chip r" title="FINRA short volume on ${sig.shorted.day}">⚠ Heavy short selling (${Math.round(sig.shorted.ratio * 100)}% of volume)</span>` : ''}
 ${(sig.footprints ?? []).map((f) => html`<a class="chip ${f.on ? 'g' : ''}" href="/backtest" title="${f.on ? 'Proven in the strategy lab on unseen data' : 'Not proven in the strategy lab'}">${f.on ? '🐋 ' : ''}${f.name}${f.on ? ' ✓' : ''}</a>`)}
 ${halalChip(sig)}<span class="chip g">✓ XTB shares</span>
 <span class="chip">${sig.source} · ${timeAgo(sig.newsTime)}</span>
@@ -6687,9 +6770,9 @@ function scorecardPage({ engine }) {
   const share = (list, f) => (list.length ? list.filter(f).length / list.length : null);
   const half = Math.round(config.halfGain * 100); const full = Math.round(config.targetGain * 100);
   const body = html`<h1>Scorecard</h1>
-<p class="sub">Every signal is checked against what the price really did over the next 10 trading days, using your plan: sell half at +${half}% and move the stop to entry, sell the rest at +${full}%.</p>
-${scored.length ? html`<div class="scroll"><table class="list"><tr><th>First verdict</th><th>Signals</th><th>Reached +${half}%</th><th>Reached +${full}%</th><th>Stopped out</th><th>Avg trade result</th><th>Avg best gain</th></tr>
-${groups.map(([k, label]) => { const list = scored.filter((s) => first(s) === k); if (!list.length) return ''; return html`<tr><td><b>${label}</b></td><td>${list.length}</td><td>${pct(share(list, (s) => s.outcome.hit10), 0, false)}</td><td>${pct(share(list, (s) => s.outcome.hit20), 0, false)}</td><td>${pct(share(list, (s) => s.outcome.stopped), 0, false)}</td><td>${isNum(avg(list, (s) => s.outcome.tradeReturn)) ? changeSpan(avg(list, (s) => s.outcome.tradeReturn)) : '–'}</td><td>${isNum(avg(list, (s) => s.outcome.maxGain)) ? changeSpan(avg(list, (s) => s.outcome.maxGain)) : '–'}</td></tr>`; })}
+<p class="sub">Every signal is checked against what the price really did over the next 10 trading days, using your plan: sell half at +${half}% and move the stop to entry, sell the rest at +${full}%. "vs market" takes away what small caps (IWM) or Europe did over the same days, so a rising market doesn't flatter the results.</p>
+${scored.length ? html`<div class="scroll"><table class="list"><tr><th>First verdict</th><th>Signals</th><th>Reached +${half}%</th><th>Reached +${full}%</th><th>Stopped out</th><th>Avg trade result</th><th>vs market</th><th>Avg best gain</th></tr>
+${groups.map(([k, label]) => { const list = scored.filter((s) => first(s) === k); if (!list.length) return ''; return html`<tr><td><b>${label}</b></td><td>${list.length}</td><td>${pct(share(list, (s) => s.outcome.hit10), 0, false)}</td><td>${pct(share(list, (s) => s.outcome.hit20), 0, false)}</td><td>${pct(share(list, (s) => s.outcome.stopped), 0, false)}</td><td>${isNum(avg(list, (s) => s.outcome.tradeReturn)) ? changeSpan(avg(list, (s) => s.outcome.tradeReturn)) : '–'}</td><td>${isNum(avg(list, (s) => s.outcome.vsMarket)) ? changeSpan(avg(list, (s) => s.outcome.vsMarket)) : '–'}</td><td>${isNum(avg(list, (s) => s.outcome.maxGain)) ? changeSpan(avg(list, (s) => s.outcome.maxGain)) : '–'}</td></tr>`; })}
 </table></div>
 <h2>Recent signals</h2><div class="scroll"><table class="list"><tr><th>Stock</th><th>When</th><th>Verdict</th><th>Entry</th><th>1 day</th><th>5 days</th><th>Best</th><th>Result</th></tr>
 ${scored.slice(0, 80).map((s) => moneyIn(s.currency ?? 'USD', () => html`<tr><td><a href="/s/${encodeURIComponent(s.symbol)}"><b>${s.symbol}</b></a></td><td class="small">${dubaiTime(s.createdAt)}</td><td>${VERDICTS[first(s)]?.label}</td><td>${money(s.outcome.entry)}</td>
