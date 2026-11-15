@@ -86,7 +86,7 @@ async function aiClassify(net, config, items) {
   const response = await net.request(config.ai.url, {
     method: 'POST',
     headers: { 'x-api-key': config.ai.key, 'anthropic-version': config.ai.version, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: config.ai.model, temperature: 0, max_tokens: 220 * items.length + 200, system: SYSTEM, messages: [{ role: 'user', content: JSON.stringify(payload) }] }),
+    body: JSON.stringify({ model: config.ai.model, max_tokens: 220 * items.length + 200, system: SYSTEM, messages: [{ role: 'user', content: JSON.stringify(payload) }] }),
     timeout: 45000,
     retries: 0,
     ua: 'halal-swing-site',
@@ -455,6 +455,7 @@ function rankScore(sig, now = Date.now()) {
     // A setup the strategy lab proved on unseen data, on the same stock: big buyers agree with the news.
     + ((sig.footprints ?? []).some((f) => f.on) ? 8 : 0)
     - (sig.shorted ? 4 : 0)
+    - ((sig.footprints ?? []).some((f) => f.warn) ? 4 : 0)
     - Math.min(12, Math.max(0, hours) * 0.25);
 }
 
@@ -957,6 +958,7 @@ const { decide, VERDICTS } = require('./analysis/plan');
 const { explodeCheck } = require('./analysis/explode');
 const { explain } = require('./analysis/explain');
 const { scalpCheck } = require('./analysis/scalp');
+const { EXITS: EXITS_LAB, runTrade: runLabTrade } = require('./features/lab');
 const { session: pennySession, findEntry, ENTRIES: PENNY_ENTRIES, manage: pennyManage, EXITS: PENNY_EXITS } = require('./features/pennylab');
 const { alertText, scalpAlertText, sendTelegram } = require('./telegram');
 const { alertWorthy, rankScore } = require('./analysis/rank');
@@ -1615,7 +1617,7 @@ class Engine {
       verdict: decision.kind,
       reason: decision.reason,
       notes: decision.notes,
-      levels: decision.levels,
+      levels: decision.levels ? { ...decision.levels, exitRule: this.swingExit(), atr: ta?.atr ?? null, exitStop: this.exitStop(this.swingExit(), decision.levels.entry, ta?.atr, decision.levels.stop) } : null,
       ten: decision.ten,
       explode: decision.explode,
       explain: decision.explain,
@@ -1623,7 +1625,7 @@ class Engine {
       strength: decision.strength,
       buzz: this.buzzFor(item.symbol),
       // Smart-money footprints on the last finished day, and how each did in the strategy lab.
-      footprints: [...this.setupsFor(item.symbol, quote?.candles ?? [], now.getTime()).map((f) => ({ setup: f.setup, name: f.short, on: f.on, verdict: f.result?.verdict?.key ?? null, exit: f.result?.exitName ?? null })),
+      footprints: [...this.setupsFor(item.symbol, quote?.candles ?? [], now.getTime()).map((f) => ({ setup: f.setup, name: f.short, on: f.on, warn: f.warn, lost: f.warn ? f.result?.outSample?.avgAdj ?? null : null, verdict: f.result?.verdict?.key ?? null, exit: f.result?.exitName ?? null })),
         ...(item.smart ? [{ setup: item.smart, name: require('./features/lab').SETUPS[item.smart]?.short ?? item.smart, on: this.labOn(item.smart), verdict: this.state.lab?.results?.[item.smart]?.verdict?.key ?? null, filing: true }] : [])],
       topBank: item.cls.topBank ?? null,
       shorted: this.heavyShort(item.symbol),
@@ -1741,7 +1743,19 @@ class Engine {
         const b1 = bc.filter((c) => dayKey(c.t) <= dayKey(exitAt)).pop()?.c;
         if (b0 && b1) market = b1 / b0 - 1;
       } catch { /* no benchmark: raw result only */ }
+      // Signals traded with another exit (picked by the news lab) are scored with that exit.
+      const rule = signal.levels?.exitRule ?? 'site';
+      let ruleDone = null;
+      if (rule !== 'site' && EXITS_LAB[rule]) {
+        const i0 = quote.candles.indexOf(after[0]);
+        const bars = intraday ? [...quote.candles.slice(0, i0), { ...after[0], o: entry, h: entry, l: entry, c: entry }, ...quote.candles.slice(i0)] : quote.candles;
+        const e = intraday ? i0 : i0;
+        const tr = runLabTrade(bars, e, intraday ? { ...EXITS_LAB[rule], days: EXITS_LAB[rule].days + 1 } : EXITS_LAB[rule], 0, signal.levels?.atr ?? entry * 0.04);
+        if (tr && !tr.open) { tradeReturn = tr.net; result = tr.reason === 'stop' ? 'stopped' : tr.reason === 'target' ? 'full' : 'time'; ruleDone = true; }
+        else if (tr?.open) { result = 'open'; tradeReturn = lastC; ruleDone = false; }
+      }
       signal.outcome = {
+        exitRule: rule,
         entry,
         market,
         vsMarket: market === null || tradeReturn === null ? null : tradeReturn - market,
@@ -1754,7 +1768,7 @@ class Engine {
         result,
         tradeReturn,
         days: window.length,
-        done: window.length >= 10 || ['stopped', 'full', 'half'].includes(result),
+        done: ruleDone ?? (window.length >= 10 || ['stopped', 'full', 'half'].includes(result)),
       };
       this.touch();
       await sleep(250);
@@ -2117,6 +2131,26 @@ class Engine {
     return n;
   }
 
+  // The swing exit: the site's plan (half +10%, rest +20%), unless the news lab found another
+  // exit that beat it on BOTH years for the news the site trades.
+  swingExit() {
+    const nl = this.state.newsLab;
+    const g = nl?.grid?.[nl?.best?.filter];
+    const x = nl?.best?.exit;
+    if (!g || !x || x === 'site') return 'site';
+    const c = g[x]; const site = g.site;
+    if (c?.outSample?.n >= 30 && site?.outSample?.n >= 30 && c.outSample.avgAdj > site.outSample.avgAdj && c.inSample?.avgAdj > site.inSample?.avgAdj) return x;
+    return 'site';
+  }
+
+  // The first stop for an exit rule (the site's own plan keeps its stop under support).
+  exitStop(rule, entry, atr, siteStop) {
+    if (rule === 'trail') return Math.max(entry * 0.85, entry - 2.5 * (atr || entry * 0.04));
+    if (rule === 'hold20') return entry * 0.9;
+    if (rule === 'hold5') return entry * 0.92;
+    return siteStop;
+  }
+
   // Which penny rule the site trades: the VWAP pullback when the penny lab shows it made money in
   // both years while the high-of-day breakout lost; otherwise the breakout.
   scalpRule() {
@@ -2194,6 +2228,9 @@ class Engine {
     if (!(entry > 0)) throw new Error('Enter the price you paid.');
     const signal = this.state.signals.find((x) => x.symbol === sym);
     const riskPct = Math.min(0.15, Math.max(0.04, signal?.levels?.riskPct ?? 0.1));
+    const exitRule = signal?.levels?.exitRule ?? this.swingExit();
+    const atr = signal?.levels?.atr ?? null;
+    const firstStop = this.exitStop(exitRule, entry, atr, entry * (1 - riskPct));
     const trade = {
       id: hash(`${sym}|${entry}|${Date.now()}`),
       symbol: sym,
@@ -2201,8 +2238,11 @@ class Engine {
       shares: qty,
       date: date || new Date().toISOString().slice(0, 10),
       openedAt: new Date().toISOString(),
-      stop: entry * (1 - riskPct),
-      firstStop: entry * (1 - riskPct),
+      stop: firstStop,
+      firstStop,
+      exitRule,
+      atr,
+      peak: entry,
       t1: entry * (1 + this.config.halfGain),
       t2: entry * (1 + this.config.targetGain),
       half: false,
@@ -2242,6 +2282,24 @@ class Engine {
         t.events.push(key);
         try { await sendTelegram(this.net, this.config, `${text}\n${this.config.siteUrl}/trades`); } catch { /* shown on status page */ }
       };
+      const rule = t.exitRule ?? 'site';
+      const ageDays = (now - Date.parse(t.openedAt)) / DAY;
+      if (rule !== 'site') {
+        if (rule === 'trail') {
+          t.peak = Math.max(t.peak ?? t.entry, price);
+          const trail = t.peak - 2.5 * (t.atr || t.entry * 0.04);
+          if (trail > t.stop * 1.03) {
+            t.stop = trail;
+            await say(`trail-${Math.round(trail * 100)}`, `⬆️ ${t.symbol} at ${money(price)}: raise your stop to ${money(trail)} (trailing 2.5× the daily range under the high ${money(t.peak)}).`);
+          }
+        }
+        const maxDays = rule === 'hold5' ? 7 : 28;
+        if (price <= t.stop) await say('stop', `🛑 ${t.symbol} hit your ${rule === 'trail' ? 'trailing ' : ''}stop ${money(t.stop)} (now ${money(price)}, ${pct(price / t.entry - 1)} from your entry). Time to exit.`);
+        else if (ageDays >= maxDays) await say('time', `⏰ ${t.symbol}: ${rule === 'hold5' ? '5' : '20'} trading days are up (${pct(price / t.entry - 1)}). The plan says sell now.`);
+        this.touch();
+        await sleep(250);
+        continue;
+      }
       if (!t.half && price >= t.t1) {
         t.half = true;
         t.stop = t.entry;
@@ -3270,7 +3328,13 @@ const mixin = {
   // Setups on the last finished day for one stock, with how each setup did on unseen data.
   setupsFor(symbol, candles, now = Date.now()) {
     const lab = this.state.lab;
-    return setupsOn(candles ?? [], now).map((x) => ({ ...x, short: SETUPS[x.setup]?.short ?? x.setup, result: lab?.results?.[x.setup] ?? null, on: this.labOn(x.setup) }));
+    return setupsOn(candles ?? [], now).map((x) => {
+      const result = lab?.results?.[x.setup] ?? null;
+      const o = result?.outSample;
+      // A pattern that clearly LOST on the unseen year is a warning, not a footprint.
+      const warn = Boolean(o?.n >= 30 && o.avgAdj < 0 && o.t <= -2);
+      return { ...x, short: SETUPS[x.setup]?.short ?? x.setup, result, on: this.labOn(x.setup), warn };
+    });
   },
 
   // Today's setups across the whole list, from the charts the site already holds.
@@ -3636,6 +3700,8 @@ const mixin = {
       t1Pct: levels.target1 / levels.entry - 1,
       t2Pct: levels.target2 / levels.entry - 1,
       half: null,
+      exitRule: kind === 'swing' ? levels.exitRule ?? 'site' : levels.exitRule ?? 'targets',
+      atr: levels.atr ?? null,
       currency: this.quotes?.get(symbol)?.quote?.currency ?? 'USD',
       cost: tradeCost(price, this.quotes?.get(symbol)?.quote?.currency ?? 'USD', this.config),
       status: open ? 'open' : 'pending',
@@ -3650,7 +3716,8 @@ const mixin = {
 
   setPaperLevels(pos, entry) {
     pos.entry = entry;
-    pos.stop = entry * (1 - pos.stopPct);
+    pos.peak = entry;
+    pos.stop = pos.kind === 'swing' && pos.exitRule && pos.exitRule !== 'site' && this.exitStop ? this.exitStop(pos.exitRule, entry, pos.atr, entry * (1 - pos.stopPct)) : entry * (1 - pos.stopPct);
     pos.t1 = entry * (1 + pos.t1Pct);
     pos.t2 = entry * (1 + pos.t2Pct);
   },
@@ -3679,6 +3746,17 @@ const mixin = {
         pos.filledAt = now.toISOString();
         this.setPaperLevels(pos, price);
         this.touch();
+        continue;
+      }
+      const rule = pos.exitRule ?? 'site';
+      if (rule !== 'site') {
+        // The exit the news lab picked: a trailing stop, or a fixed hold with a stop.
+        if (rule === 'trail') { pos.peak = Math.max(pos.peak ?? pos.entry, price); pos.stop = Math.max(pos.stop, pos.peak - 2.5 * (pos.atr || pos.entry * 0.04)); }
+        const maxDays = rule === 'hold5' ? 7 : 28;
+        if (price <= pos.stop) this.paperClose(pos, price, rule === 'trail' ? 'trail stop' : 'stopped', now);
+        else if (now - Date.parse(pos.filledAt ?? pos.openedAt) > maxDays * DAY) this.paperClose(pos, price, 'time', now);
+        this.touch();
+        await sleep(150);
         continue;
       }
       if (!pos.half && price >= pos.t1) { pos.half = price; pos.stop = pos.entry; }
@@ -6086,7 +6164,7 @@ module.exports = { FileStore, GitHubStore, createStore };
 // ---------- telegram.js ----------
 __defs["telegram"] = (module, exports, require) => {
 // Sends alerts to the owner's Telegram chat.
-const { money, pct, openInDubai, moneyIn, isIntl } = require('./lib/util');
+const { money, pct, openInDubai, moneyIn, isIntl, isNum } = require('./lib/util');
 const { VERDICTS } = require('./analysis/plan');
 const { CATALYSTS } = require('./rules');
 const { tipFor } = require('./analysis/tips');
@@ -6109,11 +6187,12 @@ function alertTextIn(signal, config) {
     `⚡ ${CATALYSTS[signal.catalyst]?.label ?? 'News'} · impact ${signal.impact}/10 · effect: ${signal.horizon}`,
     signal.topBank ? `🏦 Upgrade from a top bank: ${signal.topBank}` : '',
     signal.buzz?.rising ? `🔥 Reddit buzz rising: ${signal.buzz.mentions} mentions vs ${signal.buzz.prev} a day ago` : '',
+    (signal.footprints ?? []).some((f) => f.warn) ? `⚠ Chart pattern that lost in the strategy lab: ${(signal.footprints ?? []).filter((f) => f.warn).map((f) => `${f.name}${isNum(f.lost) ? ` (${pct(f.lost, 1)} vs market a trade)` : ''}`).join(', ')}` : '',
     signal.shorted ? `⚠ Heavy short selling: ${Math.round(signal.shorted.ratio * 100)}% of volume on ${signal.shorted.day} — short sellers are betting against it` : '',
     (signal.footprints ?? []).some((f) => f.on) ? `🐋 Smart money: ${(signal.footprints ?? []).filter((f) => f.on).map((f) => `${f.name}${f.exit ? ` — lab exit: ${f.exit}` : ''}`).join('; ')} (proven in the strategy lab)` : '',
     `📋 10-point check ${signal.ten?.score ?? '?'}/10 · 💥 explosion check ${signal.explode?.score ?? '?'}/10 (${signal.explode?.label ?? ''})`,
-    l ? `🎯 Entry ${money(l.entry)} · Stop ${money(l.stop)}` : '',
-    l ? `💰 Sell half ${money(l.target1)} (+${Math.round(config.halfGain * 100)}%), then stop → entry · Sell rest ${money(l.target2)} (+${Math.round(config.targetGain * 100)}%)` : '',
+    l ? `🎯 Entry ${money(l.entry)} · Stop ${money(l.exitRule && l.exitRule !== 'site' ? l.exitStop ?? l.stop : l.stop)}` : '',
+    l && l.exitRule && l.exitRule !== 'site' ? `💰 Exit (picked by the news lab): ${EXIT_TEXT[l.exitRule] ?? l.exitRule}` : l ? `💰 Sell half ${money(l.target1)} (+${Math.round(config.halfGain * 100)}%), then stop → entry · Sell rest ${money(l.target2)} (+${Math.round(config.targetGain * 100)}%)` : '',
     l?.options ? `↔️ Day 1: ${l.options.dayOne.text}\n↔️ Pullback: ${l.options.pullback.text}` : '',
     `➡️ ${signal.reason}`,
     ...(signal.explain?.good ?? []).slice(0, 2).map((g) => `✅ ${g.title}: ${g.note}`),
@@ -6143,6 +6222,12 @@ async function sendTelegram(net, config, text) {
   }
   return true;
 }
+
+const EXIT_TEXT = {
+  trail: 'no fixed target — keep a trailing stop 2.5× the daily range under the highest price, for up to 20 trading days. The site messages you when to raise it.',
+  hold20: 'hold up to 20 trading days with a stop 10% under your entry.',
+  hold5: 'hold 5 trading days with a stop 8% under your entry.',
+};
 
 function scalpAlertText(x, config) {
   const l = x.levels;
@@ -6759,7 +6844,7 @@ ${sig.atOpen ? html`<span class="chip">Moves at open</span>` : ''}
 ${sig.topBank ? html`<span class="chip b">🏦 ${sig.topBank}</span>` : ''}
 ${sig.buzz?.rising ? html`<span class="chip b" title="${sig.buzz.mentions} Reddit mentions vs ${sig.buzz.prev} a day ago">🔥 Reddit buzz rising</span>` : ''}
 ${sig.shorted ? html`<span class="chip r" title="FINRA short volume on ${sig.shorted.day}">⚠ Heavy short selling (${Math.round(sig.shorted.ratio * 100)}% of volume)</span>` : ''}
-${(sig.footprints ?? []).map((f) => html`<a class="chip ${f.on ? 'g' : ''}" href="/backtest" title="${f.on ? 'Proven in the strategy lab on unseen data' : 'Not proven in the strategy lab'}">${f.on ? '🐋 ' : ''}${f.name}${f.on ? ' ✓' : ''}</a>`)}
+${(sig.footprints ?? []).map((f) => html`<a class="chip ${f.on ? 'g' : f.warn ? 'r' : ''}" href="/backtest" title="${f.on ? 'Proven in the strategy lab on unseen data' : f.warn ? 'This pattern lost against the market in the strategy lab' : 'Not proven in the strategy lab'}">${f.on ? '🐋 ' : f.warn ? '⚠ ' : ''}${f.name}${f.on ? ' ✓' : f.warn && isNum(f.lost) ? ` (lab ${pct(f.lost, 1)})` : ''}</a>`)}
 ${halalChip(sig)}<span class="chip g">✓ XTB shares</span>
 <span class="chip">${sig.source} · ${timeAgo(sig.newsTime)}</span>
 </div>
@@ -6768,6 +6853,7 @@ ${explodeBubble(sig.explode)}
 ${explainBox(sig.explain, { limit: 4 })}
 ${quote ? chartSvg({ candles: quote.candles, ta, levels: sig.levels, days: 50, height: 300, compact: true, id: `c-${sig.id}` }) : ''}
 ${tradeStats(sig.levels, { rvol: sig.rvol, float: sig.floatShares, mcap: sig.marketCap }, config)}
+${sig.levels?.exitRule && sig.levels.exitRule !== 'site' ? html`<p class="small"><b>Exit (picked by the <a href="/backtest">news lab</a>):</b> ${{ trail: `trailing stop 2.5× the daily range under the highest price (starts at ${money(sig.levels.exitStop)}), up to 20 trading days — no fixed target.`, hold20: `hold up to 20 trading days, stop ${money(sig.levels.exitStop)} (−10%).`, hold5: `hold 5 trading days, stop ${money(sig.levels.exitStop)} (−8%).` }[sig.levels.exitRule] ?? sig.levels.exitRule}</p>` : ''}
 <div class="ten-head"><b>10-point check · ${sig.ten?.score ?? '?'}/10</b> <span class="small dim">✓ pass · ! caution · ✕ fail · – no data</span></div>
 ${tenGrid(sig.ten)}
 <details class="ten-more"><summary>See the reason for each point</summary>${tenList(sig.ten)}</details>
@@ -6898,7 +6984,7 @@ function smartBox(engine, symbol, quote) {
   const buys = (engine.state.insiderBuys?.buys ?? []).filter((b) => b.symbol === symbol).slice(0, 5);
   if (!setups.length && !acts.length && !buys.length) return '';
   return html`<h2>Smart money</h2><div class="chips">
-${setups.map((f) => html`<a class="chip ${f.on ? 'g' : ''}" href="/backtest">${f.on ? '🐋 ' : ''}${f.short} (${f.day})${f.result?.outSample?.n ? html` · lab ${pct(f.result.outSample.avgAdj, 1)} vs market` : ''}</a>`)}
+${setups.map((f) => html`<a class="chip ${f.on ? 'g' : f.warn ? 'r' : ''}" href="/backtest">${f.on ? '🐋 ' : f.warn ? '⚠ ' : ''}${f.short} (${f.day})${f.result?.outSample?.n ? html` · lab ${pct(f.result.outSample.avgAdj, 1)} vs market` : ''}</a>`)}
 ${acts.map((a) => html`<span class="chip ${a.strong && !a.amendment ? 'g' : ''}">13D: ${a.who}${isNum(a.percent) ? ` ${a.percent.toFixed(1)}%` : ''} — ${a.purpose} · ${timeAgo(a.at)}</span>`)}
 ${buys.map((b) => html`<span class="chip g">Insider: ${b.name}${b.title ? ` (${b.title})` : ''} bought $${compact(b.value)} · ${timeAgo(b.at)}</span>`)}
 </div>`;
