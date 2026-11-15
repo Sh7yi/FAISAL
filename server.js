@@ -502,7 +502,7 @@ function vwapOf(candles, from) {
   return { vwap: v ? pv / v : null, series };
 }
 
-function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = new Date(), config, halt = null, lateOk = false, stopsToday = 0 }) {
+function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = new Date(), config, halt = null, lateOk = false, stopsToday = 0, rule = 'breakout', pullback = null }) {
   const sc = config.scalp;
   const candles = intra?.candles ?? [];
   const price = intra?.price ?? candles[candles.length - 1]?.c ?? null;
@@ -560,6 +560,17 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
   } else if (!goodNews) { kind = 'WATCH'; reason = 'Moving, but no good news found since yesterday\'s close — no news, no trade.'; }
   else if (isNum(aboveVwap) && aboveVwap < -0.02) { kind = 'AVOID'; reason = `Below VWAP ${money(vwap)} — sellers are in control right now.`; }
   else if (isNum(aboveVwap) && aboveVwap > sc.maxAboveVwap) { kind = 'WAIT_PULLBACK'; reason = `Stretched ${pct(aboveVwap)} above VWAP — chasing is risky. Wait for a dip toward ${money(vwap)} that holds.`; }
+  // The VWAP-pullback rule (when the penny lab shows it beats breakouts): buy the first dip to
+  // VWAP that curls back up, before 11:00, and hold while it stays above VWAP.
+  else if (rule === 'pullback') {
+    if (pullback?.now && minutesIn <= 90 && stopsToday < (sc.maxStopsPerDay ?? 2)) {
+      kind = 'BUY_NOW';
+      reason = `First pullback to VWAP ${money(vwap)} just curled back up, with news. Hold while it stays above VWAP; sell on the first 1-minute close below it.`;
+    } else {
+      kind = 'WATCH';
+      reason = minutesIn > 90 ? 'After 11:00 New York — no new scalps.' : stopsToday >= (sc.maxStopsPerDay ?? 2) ? `${stopsToday} scalps already stopped out today — no new scalps until tomorrow.` : `Waiting for the first pullback to VWAP ${money(vwap)} that holds and curls back up — chasing the high loses in the lab.`;
+    }
+  }
   // Within 1% of the high counts as at the high: on a $1 stock that is a single cent.
   else if (isNum(hod) && price < hod * 0.99) {
     kind = price >= hod * 0.97 ? 'WAIT_BREAKOUT' : 'WATCH';
@@ -580,6 +591,13 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
 
   // Tight scalp plan: stop under VWAP or the last 5-minute low (max 6%), sell half +5%, rest +10%.
   let entry = price;
+  if (rule === 'pullback' && pullback?.now) {
+    let stop0 = Math.max(price * (1 - sc.maxStop), Math.min(pullback.vwap * 0.99, pullback.low5 * 0.995));
+    if (!(stop0 < price * 0.985)) stop0 = price * 0.97;
+    const lv = { entry: price, stop: stop0, target1: price * (1 + sc.t1), target2: price * (1 + sc.t2), riskPct: 1 - stop0 / price, rr: sc.t2 / (1 - stop0 / price), exitRule: 'vwap' };
+    const alertP = gapper && kind === 'BUY_NOW' && score >= sc.alertScore - 1;
+    return { kind, reason, items, score, levels: lv, vwap, vwapSeries: series, hod, preHigh, change, gap, gapper, volume, rvol, surge, aboveVwap, prime, price, news: goodNews, alert: alertP, rule };
+  }
   if (kind === 'WAIT_BREAKOUT' && hod) entry = hod * 1.003;
   if (kind === 'WAIT_PULLBACK' && vwap) entry = vwap * 1.01;
   if (state === 'pre' && preHigh) entry = preHigh * 1.003;
@@ -588,7 +606,7 @@ function scalpCheck({ intra, avgVol, floatShares, dilution, news, state, now = n
   const levels = isNum(entry) ? { entry, stop, target1: entry * (1 + sc.t1), target2: entry * (1 + sc.t2), riskPct: 1 - stop / entry, rr: (sc.t2) / (1 - stop / entry) } : null;
   const alert = gapper && kind === 'BUY_NOW' && (score >= sc.alertScore + (prime ? 0 : 1));
 
-  return { kind, reason, items, score, levels, vwap, vwapSeries: series, hod, preHigh, change, gap, gapper, volume, rvol, surge, aboveVwap, prime, price, news: goodNews, alert };
+  return { kind, reason, items, score, levels, vwap, vwapSeries: series, hod, preHigh, change, gap, gapper, volume, rvol, surge, aboveVwap, prime, price, news: goodNews, alert, rule };
 }
 
 module.exports = { scalpCheck, vwapOf };
@@ -939,6 +957,7 @@ const { decide, VERDICTS } = require('./analysis/plan');
 const { explodeCheck } = require('./analysis/explode');
 const { explain } = require('./analysis/explain');
 const { scalpCheck } = require('./analysis/scalp');
+const { session: pennySession, findEntry, ENTRIES: PENNY_ENTRIES, manage: pennyManage, EXITS: PENNY_EXITS } = require('./features/pennylab');
 const { alertText, scalpAlertText, sendTelegram } = require('./telegram');
 const { alertWorthy, rankScore } = require('./analysis/rank');
 const tgstore = require('./sources/tgstore');
@@ -2042,12 +2061,20 @@ class Engine {
         const since = now.getTime() - (nyClock(now).minutes + 8 * 60) * MINUTE;
         const news = s.news.filter((n) => (n.symbol === sym || n.symbols?.includes(sym)) && Date.parse(n.time) >= since);
         const halt = (s.halts?.day === today ? s.halts.list : []).find((h) => h.symbol === sym && (!h.resumeAt || now - Date.parse(h.resumeAt) < 3 * MINUTE));
-        const check = scalpCheck({ intra, avgVol, floatShares: fl, dilution: info.dilution, news, state: st, now, config, halt, lateOk: this.pennyLateOk(), stopsToday: this.scalpStopsToday(now) });
+        const rule = this.scalpRule();
+        let pullback = null;
+        if (rule === 'pullback' && st === 'open') {
+          // The same code the penny lab replays: a trigger on the last finished minute means buy now.
+          const bars = pennySession(intra.candles ?? []);
+          const pb = findEntry(bars, PENNY_ENTRIES.vwap_pb, { prevClose: intra.prevClose, avgVolRaw: avgVol }, this.config.scalp);
+          if (pb) pullback = { ...pb, now: pb.k >= bars.length - 1 };
+        }
+        const check = scalpCheck({ intra, avgVol, floatShares: fl, dilution: info.dilution, news, state: st, now, config, halt, lateOk: this.pennyLateOk(), stopsToday: this.scalpStopsToday(now), rule, pullback });
         const { vwapSeries, ...keep } = check;
         rows.push({ symbol: sym, name: intra.name, ...keep, at: now.toISOString() });
         const sentToday = s.scalp.alerts.filter((a) => a.day === today).length;
         if (check.alert && sentToday < this.config.scalp.alertsPerDay && !s.scalp.alerts.some((a) => a.symbol === sym && a.day === today)) {
-          const alert = { id: hash(`${sym}|${today}|scalp`), symbol: sym, day: today, at: now.toISOString(), price: check.price, levels: check.levels, score: check.score, reason: check.reason, news: check.news?.title ?? '', result: null };
+          const alert = { id: hash(`${sym}|${today}|scalp`), symbol: sym, day: today, at: now.toISOString(), price: check.price, levels: check.levels, score: check.score, reason: check.reason, news: check.news?.title ?? '', result: null, exitRule: check.levels?.exitRule ?? 'targets' };
           s.scalp.alerts.unshift(alert);
           s.scalp.alerts = s.scalp.alerts.slice(0, 300);
           this.paperOpen({ kind: 'scalp', ref: alert.id, symbol: sym, price: check.price, levels: check.levels, now });
@@ -2090,6 +2117,16 @@ class Engine {
     return n;
   }
 
+  // Which penny rule the site trades: the VWAP pullback when the penny lab shows it made money in
+  // both years while the high-of-day breakout lost; otherwise the breakout.
+  scalpRule() {
+    const g = this.state.pennyLab?.grid;
+    const pb = g?.vwap_pb?.vwap; const hod = g?.hod120?.site;
+    const pos = (x) => x?.n >= 15 && x.avg > 0;
+    const worse = (x) => !x?.n || x.avg < 0;
+    return pb && pos(pb.inSample) && pos(pb.outSample) && worse(hod?.outSample) ? 'pullback' : 'breakout';
+  }
+
   // Late-morning breakouts are allowed only if the penny lab shows they make money.
   pennyLateOk() {
     const late = this.state.pennyLab?.byTime?.[2];
@@ -2119,6 +2156,17 @@ class Engine {
         const intra = await yahoo.intraday(this.net, a.symbol);
         const after = intra.candles.filter((c) => c.t >= Date.parse(a.at) && (!intra.regularEnd || c.t < intra.regularEnd));
         if (!after.length) continue;
+        if (a.exitRule === 'vwap') {
+          // Held while above VWAP: replay the same exit the penny lab uses.
+          const bars = pennySession(intra.candles);
+          const k = bars.findIndex((b) => b.t >= Date.parse(a.at));
+          if (k >= 0) {
+            const r = pennyManage(bars, { k, entry: a.levels.entry, vwap: bars[Math.max(0, k - 1)].vwap, low5: a.levels.stop / 0.995 }, PENNY_EXITS.vwap, this.config.scalp);
+            a.result = { outcome: r.reason === 'stop' ? 'stopped' : 'closed', close: r.net, maxGain: r.mfe, exit: r.reason };
+            this.paperCloseScalp(a, now);
+            continue;
+          }
+        }
         let outcome = 'neither'; let half = false;
         for (const c of after) {
           if (!half && c.l <= a.levels.stop) { outcome = 'stopped'; break; }
@@ -3204,7 +3252,9 @@ const mixin = {
     // Wait (up to 2 hours after a restart) for the insider and 13D history, so those setups are tested too.
     if (!this.state.smartHistory?.events && process.uptime() < 2 * 3600) return;
     if (!quiet || (last && now - last < 7 * DAY)) {
-      if (!this.state.pennyLab && this.labGappers?.length) await this.runPennyLab(now);
+      const pv = require('./pennylab').VERSION;
+      if ((!this.state.pennyLab || this.state.pennyLab.version !== pv) && this.labGappers?.length) await this.runPennyLab(now);
+      else if (this.state.pennyLab?.version !== pv && quiet && !this.labGappers?.length && !(now - (this.labRerunAt ?? 0) < 20 * HOUR)) { this.labRerunAt = now.getTime(); await this.runLab(now); await this.runPennyLab(now); }
       if (quiet && this.runNewsLab && (!this.state.newsLab || now - Date.parse(this.state.newsLab.at) > 7 * DAY)) await this.runNewsLab(now);
       return;
     }
@@ -3370,7 +3420,7 @@ function entryOf(candles, time) {
 }
 
 const mixin = {
-  async runNewsLab(now = new Date(), { pause = 350, batchSize = 15, maxPagesPerBatch = 200 } = {}) {
+  async runNewsLab(now = new Date(), { pause = 300, batchSize = 1, maxPagesPerBatch = 12 } = {}) {
     if (!alpaca.enabled(this.config)) { this.state.newsLab = { at: new Date().toISOString(), skipped: 'Alpaca keys are not set on Render.' }; return null; }
     if (this.newsLabBusy) return null;
     this.newsLabBusy = true;
@@ -3382,6 +3432,8 @@ const mixin = {
       const events = new Map(); // symbol -> [{ time, impact, catalyst, title }]
       let headlines = 0; let pages = 0;
       for (let b = 0; b < symbols.length; b += batchSize) {
+        // One stock at a time, so a big company's flood of headlines cannot crowd out a small
+        // company's history (each stock keeps its newest 600 headlines at most).
         const batch = symbols.slice(b, b + batchSize);
         let items = [];
         try {
@@ -3645,6 +3697,7 @@ const mixin = {
     if (!pos || !alert.result) return;
     const r = alert.result;
     if (r.outcome === 'unknown') { p.positions = p.positions.filter((x) => x.id !== pos.id); this.touch(); return; }
+    if (r.outcome === 'closed') { this.paperClose(pos, pos.entry * (1 + (r.close ?? 0)), r.exit ?? 'close', now); return; }
     if (r.outcome === 'both') { pos.half = pos.t1; this.paperClose(pos, pos.t2, 'full', now); }
     else if (r.outcome === 'half') { pos.half = pos.t1; this.paperClose(pos, Math.max(pos.entry, pos.entry * (1 + (r.close ?? 0))), 'half', now); }
     else if (r.outcome === 'stopped') this.paperClose(pos, pos.stop, 'stopped', now);
@@ -3679,6 +3732,7 @@ const alpaca = require('../sources/alpaca');
 const { DAY, sleep, dayKey, nyClock } = require('../lib/util');
 const { summarize, verdict, mean } = require('./lab');
 
+const VERSION = 2; // bump when the rules change, so the lab runs again
 const OPEN = 9 * 60 + 30;
 const CLOSE = 16 * 60;
 
@@ -3750,12 +3804,13 @@ function findEntry(bars, rule, ctx, sc) {
   for (let k = 2; k < bars.length - 1 && bars[k].m < rule.cutoff; k++) {
     const b = bars[k];
     if (b.h / b.vwap - 1 >= 0.08) ran = true;
-    if (ran && b.l <= b.vwap * 1.015 && b.c >= b.vwap * 0.995) touched = k;
-    if (b.c < b.vwap * 0.98) { touched = -1; }
+    // The curl: a minute closing above the one before's high, above VWAP, soon after the dip.
     if (touched >= 0 && k > touched && k - touched <= 5 && b.c > bars[k - 1].h && b.c > b.vwap && b.c >= sc.minPrice && b.c <= sc.maxPrice) {
       const low = Math.min(...bars.slice(Math.max(0, touched - 1), k + 1).map((x) => x.l));
       return { k: k + 1, entry: bars[k + 1].o, vwap: b.vwap, low5: low };
     }
+    if (b.c < b.vwap * 0.98) touched = -1; // broke VWAP: no longer a pullback
+    else if (ran && b.l <= b.vwap * 1.015 && b.c >= b.vwap * 0.995) touched = k;
   }
   return null;
 }
@@ -3798,7 +3853,7 @@ function replay(candles, ctx, sc) {
 
 const mixin = {
   async runPennyLab(now = new Date(), { max = 700, pause = 350 } = {}) {
-    if (!alpaca.enabled(this.config)) { this.state.pennyLab = { at: new Date().toISOString(), skipped: 'Alpaca keys are not set on Render.' }; return null; }
+    if (!alpaca.enabled(this.config)) { this.state.pennyLab = { version: VERSION, at: new Date().toISOString(), skipped: 'Alpaca keys are not set on Render.' }; return null; }
     if (this.pennyLabBusy) return null;
     const gappers = (this.labGappers ?? []).slice(0, max);
     if (!gappers.length) return null;
@@ -3851,6 +3906,7 @@ const mixin = {
       const unseen = trades[ek][xk].filter((t) => t.day >= split);
       const all120 = trades.hod120.site;
       const lab = {
+        version: VERSION,
         at: new Date().toISOString(),
         seconds: Math.round((Date.now() - started) / 1000),
         gapDays: gappers.length, checked, replayed: days, failed, split,
@@ -3889,7 +3945,7 @@ const mixin = {
   },
 };
 
-module.exports = { mixin, ENTRIES, EXITS, replay, session, findEntry, manage, halfSpread };
+module.exports = { mixin, ENTRIES, EXITS, replay, session, findEntry, manage, halfSpread, VERSION };
 
 };
 
@@ -6093,12 +6149,12 @@ function scalpAlertText(x, config) {
   return [
     `⚡ SCALP BUY NOW — $${x.symbol} ${money(x.price)} (${pct(x.change)})`,
     x.name ?? '',
-    `Score ${x.score}/10${x.prime ? ' · prime time (first 2 hours)' : ''}`,
+    `Score ${x.score}/10${x.rule === 'pullback' ? ' · VWAP pullback rule' : x.prime ? ' · first hour' : ''}`,
     x.news ? `📰 ${x.news.title}` : '',
     `📈 Above VWAP ${money(x.vwap)} · high of day ${money(x.hod)} · volume ${x.rvol ? x.rvol.toFixed(1) : '?'}× normal`,
     l ? `🎯 Entry ${money(l.entry)} · Stop ${money(l.stop)} (${pct(-l.riskPct)})` : '',
-    l ? `💰 Sell half ${money(l.target1)} (+${Math.round(config.scalp.t1 * 100)}%) · rest ${money(l.target2)} (+${Math.round(config.scalp.t2 * 100)}%)` : '',
-    '⏱ Scalp: watch it closely. Exit if it loses VWAP or the stop.',
+    l?.exitRule === 'vwap' ? `💰 Hold while it stays above VWAP ${money(x.vwap)}; sell on the first 1-minute close below it (the penny lab's best exit)` : l ? `💰 Sell half ${money(l.target1)} (+${Math.round(config.scalp.t1 * 100)}%) · rest ${money(l.target2)} (+${Math.round(config.scalp.t2 * 100)}%)` : '',
+    l?.exitRule === 'vwap' ? '⏱ Scalp: most of these lose a little; a few run far. Keep the stop.' : '⏱ Scalp: watch it closely. Exit if it loses VWAP or the stop.',
     '✅ Halal (Zoya) · Real shares on XTB',
     `${config.siteUrl}/penny`,
   ].filter(Boolean).join('\n');
