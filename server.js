@@ -878,7 +878,9 @@ function loadConfig(env = process.env) {
       api: env.GITHUB_API || 'https://api.github.com',
     },
     feedsBase: (env.FEEDS_BASE || `https://raw.githubusercontent.com/${repo}/feeds`).replace(/\/$/, ''),
-    xtb: { country: env.XTB_COUNTRY || 'AE', extra: list(env.XTB_EXTRA_SYMBOLS) },
+    // XTB's UAE branch list: the same ~6,000 stocks the XTB app shows. (Filtering it by
+    // "offer for the UAE" on XTB's website cut it to ~2,300 — far fewer than the app.)
+    xtb: { country: env.XTB_COUNTRY || 'AE', branch: (env.XTB_BRANCH || 'ae').toLowerCase(), extra: list(env.XTB_EXTRA_SYMBOLS) },
     exclude: list(env.EXCLUDE_SYMBOLS),
     secUserAgent: env.SEC_USER_AGENT || 'HalalSwing personal research (admin@5brgold.com)',
     dataDir: env.DATA_DIR || join(process.cwd(), '.data'),
@@ -1811,8 +1813,20 @@ class Engine {
     const prevRows = new Map((s.scalp.rows ?? []).map((r) => [r.symbol, r]));
     const newsSyms = new Set(s.news.filter((n) => now - Date.parse(n.time) < DAY).map((n) => n.symbol));
     const all = this.pennyList();
-    const priority = all.filter((sym) => newsSyms.has(sym) || (prevRows.get(sym)?.change ?? 0) >= 0.05)
-      .sort((a, b) => (prevRows.get(b)?.change ?? 0) - (prevRows.get(a)?.change ?? 0)).slice(0, 40);
+    // One bulk price check across every penny stock finds today's big gappers first.
+    const moves = new Map();
+    if (alpaca.enabled(this.config)) {
+      try {
+        const snaps = await alpaca.snapshots(this.net, this.config, all);
+        for (const [sym, x] of Object.entries(snaps)) {
+          const base = x?.daily && dayKey(x.daily.t) === today ? x.prev?.c : x?.daily?.c;
+          if (x?.price && base) moves.set(sym, x.price / base - 1);
+        }
+      } catch { /* the 1-minute charts still run */ }
+    }
+    const moveOf = (sym) => Math.max(moves.get(sym) ?? 0, prevRows.get(sym)?.change ?? 0);
+    const priority = all.filter((sym) => moveOf(sym) >= this.config.scalp.minGap * 0.6 || newsSyms.has(sym) || moveOf(sym) >= 0.05)
+      .sort((a, b) => moveOf(b) - moveOf(a)).slice(0, 40);
     const others = all.filter((sym) => !priority.includes(sym));
     this.scalpCursor = (this.scalpCursor ?? 0) % Math.max(1, others.length);
     const turn = others.slice(this.scalpCursor, this.scalpCursor + 60 - priority.length);
@@ -4199,36 +4213,42 @@ module.exports = { fetchWires, tickersOf, FEEDS };
 
 // ---------- sources/xtb.js ----------
 __defs["sources/xtb"] = (module, exports, require) => {
-// The US stocks XTB sells as real shares (not CFDs). A GitHub job copies XTB's
-// list every day; XTB's own website is the backup.
+// The US stocks XTB sells as real shares (not CFDs), from XTB's UAE branch: the
+// same list the XTB app shows. A GitHub job copies it a few times a day (XTB's
+// website blocks Render); XTB's own website is the backup.
 async function fromMirror(net, config) {
   const body = await net.json(`${config.feedsBase}/xtb_us.json`, { timeout: 20000 });
   const symbols = (body?.symbols ?? []).map((s) => String(s).toUpperCase()).filter(Boolean);
   if (symbols.length < 200) throw new Error('mirror list too short');
-  return { symbols, updatedAt: body.updatedAt ?? null, source: 'GitHub copy of XTB list' };
+  return { symbols, branch: body.branch ?? null, updatedAt: body.updatedAt ?? null, source: 'GitHub copy of XTB list' };
 }
 
 async function fromXtb(net, config) {
   const all = [];
-  for (let page = 1; page <= 12; page++) {
-    const url = `https://www.xtb.com/web-api/v3/languages/en/branches/int/instrument-specification?pageSize=500&page=${page}&typeSlug=cashstocks&offerByCountry=${encodeURIComponent(config.xtb.country)}`;
+  for (let page = 1; page <= 20; page++) {
+    const url = `https://www.xtb.com/web-api/v3/languages/en/branches/${encodeURIComponent(config.xtb.branch)}/instrument-specification?pageSize=500&page=${page}&typeSlug=cashstocks`;
     const body = await net.json(url, { timeout: 30000 });
     const items = body?.items ?? [];
     all.push(...items);
     if (items.length < 500) break;
   }
-  const symbols = all
+  const symbols = [...new Set(all
     .filter((i) => i.instrumentCountrySymbol === 'US' && !i.closeOnly)
-    .map((i) => String(i.symbol).replace(/\.US$/i, '').toUpperCase());
+    .map((i) => String(i.symbol).replace(/\.US$/i, '').toUpperCase()))];
   if (symbols.length < 200) throw new Error('XTB list too short');
-  return { symbols, updatedAt: new Date().toISOString(), source: 'XTB website' };
+  return { symbols, branch: config.xtb.branch, updatedAt: new Date().toISOString(), source: 'XTB website (UAE branch)' };
 }
 
 async function xtbList(net, config) {
+  let mirror = null;
+  try { mirror = await fromMirror(net, config); } catch { /* use XTB directly */ }
+  // An old copy made from the smaller filtered list: try XTB directly first.
+  if (mirror && mirror.branch === config.xtb.branch) return mirror;
   try {
-    return await fromMirror(net, config);
-  } catch {
-    return fromXtb(net, config);
+    return await fromXtb(net, config);
+  } catch (error) {
+    if (mirror) return { ...mirror, source: `${mirror.source} (older, smaller list)` };
+    throw error;
   }
 }
 

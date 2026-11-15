@@ -1,5 +1,5 @@
 # Copies the data the halal site needs from websites that block Render:
-# XTB's list of US real shares (UAE offer) and the upcoming earnings dates from Nasdaq.
+# XTB's list of US real shares (UAE branch, as in the XTB app) and the upcoming earnings dates from Nasdaq.
 # The files go to the "feeds" branch, which the site reads.
 name: Data feeds
 on:
@@ -36,18 +36,19 @@ jobs:
           now = datetime.datetime.now(datetime.timezone.utc).isoformat()
           previous = 'https://raw.githubusercontent.com/${{ github.repository }}/feeds/'
 
-          # XTB: US stocks sold as real shares (not CFDs) to clients in the UAE.
+          # XTB: US stocks sold as real shares (not CFDs) by XTB's UAE branch — the full
+          # list the XTB app shows (about 6,000 stocks in all).
           try:
               items = []
-              for page in range(1, 13):
-                  j = get(f'https://www.xtb.com/web-api/v3/languages/en/branches/int/instrument-specification?pageSize=500&page={page}&typeSlug=cashstocks&offerByCountry=AE')
+              for page in range(1, 21):
+                  j = get(f'https://www.xtb.com/web-api/v3/languages/en/branches/ae/instrument-specification?pageSize=500&page={page}&typeSlug=cashstocks')
                   batch = j.get('items') or []
                   items += batch
                   if len(batch) < 500:
                       break
               us = sorted({str(i['symbol']).upper().removesuffix('.US') for i in items if i.get('instrumentCountrySymbol') == 'US' and not i.get('closeOnly')})
               assert len(us) > 200, f'only {len(us)} symbols'
-              xtb = {'updatedAt': now, 'country': 'AE', 'type': 'real shares', 'symbols': us}
+              xtb = {'updatedAt': now, 'country': 'AE', 'branch': 'ae', 'type': 'real shares', 'total': len(items), 'symbols': us}
               print('XTB', len(us), 'US real shares')
           except Exception as e:
               print('XTB failed, keeping the last copy:', e)
