@@ -48,7 +48,11 @@ jobs:
                       break
               us = sorted({str(i['symbol']).upper().removesuffix('.US') for i in items if i.get('instrumentCountrySymbol') == 'US' and not i.get('closeOnly')})
               assert len(us) > 200, f'only {len(us)} symbols'
-              xtb = {'updatedAt': now, 'country': 'AE', 'branch': 'ae', 'type': 'real shares', 'total': len(items), 'symbols': us}
+              # The other countries too: the site checks them with its own AAOIFI test.
+              intl = [{'s': str(i['symbol']), 'c': i.get('instrumentCountrySymbol'), 'cur': i.get('currencyCode'), 'n': i.get('companyName') or i.get('description') or ''}
+                      for i in items if i.get('instrumentCountrySymbol') and i.get('instrumentCountrySymbol') != 'US' and not i.get('closeOnly')]
+              xtb = {'updatedAt': now, 'country': 'AE', 'branch': 'ae', 'type': 'real shares', 'total': len(items), 'symbols': us, 'intl': intl}
+              print('XTB other countries', len(intl))
               print('XTB', len(us), 'US real shares')
           except Exception as e:
               print('XTB failed, keeping the last copy:', e)

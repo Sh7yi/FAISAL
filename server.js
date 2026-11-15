@@ -916,7 +916,7 @@ const { scalpCheck } = require('./analysis/scalp');
 const { alertText, scalpAlertText, sendTelegram } = require('./telegram');
 const { alertWorthy, rankScore } = require('./analysis/rank');
 const tgstore = require('./sources/tgstore');
-const { MINUTE, HOUR, DAY, sleep, marketState, dayKey, nyClock, isWeekday, money, pct, compact, openInDubai } = require('./lib/util');
+const { MINUTE, HOUR, DAY, sleep, marketState, dayKey, nyClock, isWeekday, money, pct, compact, openInDubai, isIntl } = require('./lib/util');
 
 const SECTOR_ETFS = ['XBI', 'XLK', 'SMH', 'XLV', 'XLE', 'XLB', 'XLY', 'XLI', 'XLC', 'XLU', 'XLP', 'ITA'];
 const ACTIVE = new Set(['BUY_NOW', 'WAIT_PULLBACK', 'WAIT_BREAKOUT']);
@@ -1180,6 +1180,8 @@ class Engine {
     loop(() => this.scanScalps(), MINUTE, 'scalp');
     loop(() => this.pollBuzz(), 15 * MINUTE, 'buzz');
     loop(() => this.scanEvents(), 30 * MINUTE, 'events');
+    loop(() => this.screenIntl(), MINUTE, 'intl-screen');
+    loop(() => this.pollIntlNews(), MINUTE, 'intl-news');
     // Opening our own address counts as a visit, so Render never puts the site to sleep.
     loop(() => this.net.request(`${this.config.siteUrl}/health`, { timeout: 30000, retries: 0 }).catch(() => {}), 10 * MINUTE, 'awake');
   }
@@ -1201,7 +1203,14 @@ class Engine {
       try {
         const list = await xtbList(this.net, this.config);
         s.xtb = { symbols: [...new Set([...list.symbols, ...this.config.xtb.extra])], updatedAt: new Date().toISOString(), source: list.source, branch: list.branch ?? null };
-        this.net.mark('XTB stock list', true, `${s.xtb.symbols.length} US real shares (${list.source})`);
+        if (list.intl?.length) {
+          const it = this.intlState();
+          it.list = list.intl;
+          it.updatedAt = s.xtb.updatedAt;
+          const keep = new Set(list.intl.map((x) => x.symbol));
+          for (const sym of Object.keys(it.screens)) if (!keep.has(sym)) delete it.screens[sym];
+        }
+        this.net.mark('XTB stock list', true, `${s.xtb.symbols.length} US + ${list.intl?.length ?? 0} other real shares (${list.source})`);
         this.touch();
       } catch (error) {
         this.net.mark('XTB stock list', false, error.message);
@@ -1240,7 +1249,11 @@ class Engine {
     const s = this.state;
     const halal = s.halal.map;
     const exclude = new Set(this.config.exclude);
-    const candidates = this.halalReady() ? s.xtb.symbols.filter((sym) => halal[sym] && !exclude.has(sym)) : [];
+    // US: rated COMPLIANT by Zoya. Elsewhere: passed the site's own AAOIFI check.
+    const candidates = [
+      ...(this.halalReady() ? s.xtb.symbols.filter((sym) => halal[sym] && !exclude.has(sym)) : []),
+      ...this.intlHalal().filter((sym) => !exclude.has(sym)),
+    ];
     const stale = !s.prices.updatedAt || Date.now() - Date.parse(s.prices.updatedAt) > 12 * HOUR;
     const missing = candidates.some((sym) => !s.prices.map[sym]);
     if (candidates.length && (stale || missing)) {
@@ -1332,6 +1345,8 @@ class Engine {
     const s = this.state;
     const now = Date.now();
     let info = s.fund[symbol] ?? {};
+    // Outside the US there are no SEC filings or Zoya reports: the site's own check stands in.
+    if (isIntl(symbol)) return info;
     try {
       if (!this.secMap || now - this.secMapAt > DAY) {
         this.secMap = await sec.tickerMap(this.net, this.config);
@@ -1556,6 +1571,8 @@ class Engine {
       strength: decision.strength,
       buzz: this.buzzFor(item.symbol),
       topBank: item.cls.topBank ?? null,
+      currency: quote?.currency ?? 'USD',
+      halalBy: isIntl(item.symbol) ? 'self' : 'zoya',
       refPrice: ta?.price ?? null,
       history: [{ at: now.toISOString(), verdict: decision.kind, price: ta?.price ?? null }],
       outcome: null,
@@ -1792,9 +1809,11 @@ class Engine {
   }
 
   // ---------- penny scalping, every minute ----------
+  // US stocks only: scalping follows the US session, halts and pre-market.
   pennyList() {
     const { minPrice, maxPrice } = this.config.scalp;
     return this.state.universe.symbols.filter((sym) => {
+      if (isIntl(sym)) return false;
       const p = this.quotes.get(sym)?.quote?.price ?? this.state.prices.map[sym]?.price;
       return typeof p === 'number' && p >= minPrice && p <= maxPrice;
     });
@@ -2056,12 +2075,17 @@ class Engine {
     return {
       symbol: sym,
       halal: this.state.halal.map[sym] ?? null,
+      screen: isIntl(sym) ? this.screenOf(sym) : null,
       ...result,
       signals,
       news: this.state.news.filter((n) => n.symbol === sym || n.symbols?.includes(sym)).slice(0, 25),
       earnings: this.state.earnings.dates?.[sym] ?? null,
       latest,
     };
+  }
+
+  currencyOf(symbol) {
+    return this.quotes.get(symbol)?.quote?.currency ?? (isIntl(symbol) ? this.state.intl?.list?.find((x) => x.symbol === symbol)?.currency : null) ?? 'USD';
   }
 
   watchlist() {
@@ -2073,7 +2097,7 @@ class Engine {
       const ta = q ? analyze(q) : null;
       rows.push({
         symbol: sym,
-        name: q?.name ?? this.state.halal.map[sym]?.name ?? '',
+        name: q?.name ?? this.state.halal.map[sym]?.name ?? this.screenOf(sym)?.name ?? '',
         price: ta?.price ?? this.state.prices.map[sym]?.price ?? null,
         changePct: ta?.changePct ?? null,
         rvol: ta?.rvol ?? null,
@@ -2083,6 +2107,8 @@ class Engine {
         toSupport: ta?.support ? ta.support.high / ta.price - 1 : null,
         news: lastNews[sym] ?? null,
         earnings: this.state.earnings.dates?.[sym] ?? null,
+        currency: q?.currency ?? (isIntl(sym) ? null : 'USD'),
+        country: isIntl(sym) ? (this.screenOf(sym)?.country ?? '') : 'US',
       });
     }
     return rows;
@@ -2090,7 +2116,7 @@ class Engine {
 }
 
 // The extra features live in their own files and are added to the engine here.
-Object.assign(Engine.prototype, require('./features/events').mixin, require('./features/paper').mixin, require('./features/learn').mixin, require('./features/reports').mixin, require('./features/backtest').mixin);
+Object.assign(Engine.prototype, require('./features/intl').mixin, require('./features/events').mixin, require('./features/paper').mixin, require('./features/learn').mixin, require('./features/reports').mixin, require('./features/backtest').mixin);
 
 module.exports = { Engine, emptyState };
 
@@ -2486,6 +2512,125 @@ module.exports = { mixin, STATUS, weekdayBefore, daysBetween };
 
 };
 
+// ---------- features/intl.js ----------
+__defs["features/intl"] = (module, exports, require) => {
+// XTB stocks outside the US (UK, Germany, France, ...). Zoya's plan only rates US
+// stocks, so the site screens these itself with the AAOIFI rules, a few a minute,
+// and reads their news from Yahoo Finance.
+const crypto = require('node:crypto');
+const yahoo = require('../sources/yahoo');
+const { profile, financials, aaoifi } = require('../sources/screen');
+const { parseFeed } = require('../lib/rss');
+const { MINUTE, HOUR, DAY, sleep, isIntl } = require('../lib/util');
+
+const hash = (text) => crypto.createHash('sha1').update(text).digest('hex').slice(0, 12);
+const RESCREEN = 30 * DAY; // company accounts change quarterly
+
+const mixin = {
+  intlState() {
+    const s = this.state;
+    if (!s.intl) s.intl = { list: [], updatedAt: null, screens: {}, newsCursor: 0 };
+    return s.intl;
+  },
+
+  // Self-screened halal stocks outside the US.
+  intlHalal() {
+    const it = this.intlState();
+    return it.list.filter((x) => it.screens[x.symbol]?.status === 'PASS').map((x) => x.symbol);
+  },
+
+  screenOf(symbol) {
+    return this.state.intl?.screens?.[symbol] ?? null;
+  },
+
+  // Exchange rate for comparing company figures with the share price.
+  async fxRate(from, to) {
+    if (!from || !to || from === to) return 1;
+    this.fx ??= new Map();
+    const key = `${from}${to}`;
+    const hit = this.fx.get(key);
+    if (hit && Date.now() - hit.at < DAY) return hit.rate;
+    const q = await yahoo.chart(this.net, `${key}=X`, { range: '5d', interval: '1d' });
+    if (!(q?.price > 0)) throw new Error(`no rate ${key}`);
+    this.fx.set(key, { rate: q.price, at: Date.now() });
+    return q.price;
+  },
+
+  // A few stocks a minute: industry, accounts and a year of prices, then the four tests.
+  async screenIntl(now = Date.now(), batch = 6) {
+    const it = this.intlState();
+    if (!it.list.length) return;
+    const due = it.list.filter((x) => {
+      const sc = it.screens[x.symbol];
+      return !sc || now - Date.parse(sc.at) > (sc.status === 'ERROR' ? 6 * HOUR : RESCREEN);
+    }).slice(0, batch);
+    let ok = 0; let failedFetch = 0;
+    for (const x of due) {
+      try {
+        const [prof, fin, q] = [await profile(this.net, x.symbol).catch(() => null), await financials(this.net, x.symbol, now), await this.getQuote(x.symbol, 6 * HOUR)];
+        const closes = (q?.candles ?? []).map((c) => c.c).filter((v) => v > 0);
+        const avgPrice = closes.length >= 60 ? closes.reduce((a, b) => a + b, 0) / closes.length : null;
+        const priceCurrency = q?.currency ?? x.currency ?? null;
+        // Exchange rates the figures need, fetched before the (synchronous) tests.
+        const base = priceCurrency === 'GBp' || priceCurrency === 'GBX' ? 'GBP' : priceCurrency;
+        const rates = {};
+        for (const fig of [fin.debt, fin.cash, fin.revenue, fin.interest]) {
+          if (fig?.currency && base && fig.currency !== base && !rates[fig.currency]) rates[fig.currency] = await this.fxRate(fig.currency, base).catch(() => null);
+        }
+        const fx = (from) => rates[from] ?? NaN;
+        const res = aaoifi({ prof: { ...prof, name: prof?.name ?? x.name }, fin, avgPrice, priceCurrency, fx });
+        it.screens[x.symbol] = { ...res, at: new Date(now).toISOString(), name: prof?.name ?? x.name, country: x.country };
+        ok++;
+      } catch (error) {
+        failedFetch++;
+        it.screens[x.symbol] = { status: 'ERROR', error: String(error.message).slice(0, 120), at: new Date(now).toISOString(), country: x.country };
+      }
+      await sleep(400);
+    }
+    const all = Object.values(it.screens);
+    const count = (st) => all.filter((x) => x.status === st).length;
+    this.net.mark('Halal check outside the US', failedFetch === 0 || ok > 0,
+      `${count('PASS')} halal, ${count('FAIL')} not halal, ${count('UNKNOWN')} not enough data, ${it.list.length - all.length + count('ERROR')} still to check (of ${it.list.length})`);
+    if (due.length) this.touch();
+  },
+
+  // Yahoo Finance news for the self-screened stocks, a few stocks each minute.
+  async pollIntlNews(perRound = 12) {
+    const it = this.intlState();
+    const syms = this.state.universe.symbols.filter(isIntl);
+    if (!syms.length) return;
+    const s = this.state;
+    const fresh = [];
+    let errors = 0;
+    for (let k = 0; k < Math.min(perRound, syms.length); k++) {
+      const sym = syms[(it.newsCursor + k) % syms.length];
+      try {
+        const xml = await this.net.text(`https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(sym)}&region=US&lang=en-US`, { timeout: 15000 });
+        for (const item of parseFeed(xml, 'Yahoo Finance').slice(0, 10)) {
+          if (!item.title || !item.date || Date.now() - Date.parse(item.date) > 2 * DAY) continue;
+          const key = `yh-${sym}-${item.link || item.title}`;
+          if (s.seen[key]) continue;
+          s.seen[key] = Date.now();
+          const tkey = `${sym}|${String(item.title).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()}`;
+          if (s.titles[tkey]) continue;
+          s.titles[tkey] = Date.now();
+          fresh.push({ id: key, nid: hash(key), symbol: sym, symbols: [sym], title: item.title, summary: item.summary ?? '', url: item.link, source: 'Yahoo Finance', time: item.date });
+        }
+      } catch {
+        errors++;
+      }
+      await sleep(250);
+    }
+    it.newsCursor = (it.newsCursor + perRound) % Math.max(1, syms.length);
+    this.net.mark('News: Yahoo (outside the US)', errors < perRound, `${fresh.length} new stories · ${syms.length} stocks in turn`);
+    await this.handleFresh(fresh);
+  },
+};
+
+module.exports = { mixin };
+
+};
+
 // ---------- features/learn.js ----------
 __defs["features/learn"] = (module, exports, require) => {
 // Self-learning: once a day the site looks at how each kind of news really did
@@ -2699,7 +2844,7 @@ const { VERDICTS } = require('../analysis/plan');
 const { bestSignals } = require('../analysis/rank');
 const { paperStats } = require('./paper');
 const { daysBetween } = require('./events');
-const { DAY, dayKey, nyClock, isWeekday, money, pct, openInDubai, dubaiClock, isNum } = require('../lib/util');
+const { DAY, dayKey, nyClock, isWeekday, money, pct, openInDubai, dubaiClock, isNum, isIntl } = require('../lib/util');
 
 const label = (k) => VERDICTS[k]?.label ?? k;
 const OUTCOME = { both: 'both targets', half: '+half then entry', stopped: 'stopped', neither: 'no target', unknown: '–' };
@@ -2732,7 +2877,7 @@ const mixin = {
     } else lines.push('', 'No new swing signals in the last 24 hours.');
 
     // Gap plans for recent signals moving before the open.
-    const recentSyms = bestSignals(s.signals, { hours: 72, now: now.getTime() }).map((x) => x.symbol).slice(0, 20);
+    const recentSyms = bestSignals(s.signals, { hours: 72, now: now.getTime() }).map((x) => x.symbol).filter((sym) => !isIntl(sym)).slice(0, 20);
     if (recentSyms.length && alpaca.enabled(this.config)) {
       try {
         const snaps = await alpaca.snapshots(this.net, this.config, recentSyms);
@@ -3042,11 +3187,24 @@ function round(value, digits = 2) {
 }
 
 // Prices under $1 need more decimals to be useful.
-function money(value) {
+// Prices are shown in the stock's own currency. Pages for a European stock set it
+// with moneyIn(currency, () => ...); everything else is in dollars.
+let CURRENCY = 'USD';
+const SIGN = { USD: ['$', ''], EUR: ['€', ''], GBP: ['£', ''], GBp: ['', 'p'], GBX: ['', 'p'], PLN: ['', ' zł'], CHF: ['CHF ', ''], SEK: ['', ' kr'], DKK: ['', ' kr'], NOK: ['', ' kr'], CZK: ['', ' Kč'], HUF: ['', ' Ft'] };
+function moneyIn(currency, fn) {
+  const before = CURRENCY;
+  CURRENCY = currency || 'USD';
+  try { return fn(); } finally { CURRENCY = before; }
+}
+function money(value, currency = CURRENCY) {
   if (!isNum(value)) return '–';
   const digits = value < 1 ? 4 : value < 10 ? 3 : 2;
-  return `$${value.toFixed(digits).replace(/(\.\d{2}\d*?)0+$/, '$1')}`;
+  const [pre, post] = SIGN[currency] ?? [`${currency} `, ''];
+  return `${pre}${value.toFixed(digits).replace(/(\.\d{2}\d*?)0+$/, '$1')}${post}`;
 }
+// Site symbols for stocks outside the US carry Yahoo's exchange ending (VOD.L, SAP.DE).
+const INTL = /\.(L|DE|PA|MC|MI|AS|WA|LS|BR|SW|CO|ST|OL|HE|PR|VI|IR)$/;
+const isIntl = (symbol) => INTL.test(String(symbol));
 
 function pct(value, digits = 1, signed = true) {
   if (!isNum(value)) return '–';
@@ -3142,8 +3300,7 @@ function dayKey(when) {
 }
 
 module.exports = {
-  MINUTE, HOUR, DAY, openInDubai, dubaiClock, sleep, clamp, isNum, round, money, pct, compact, timeAgo, dubaiTime, nyClock, marketState, sessionFraction, dayKey, isWeekday,
-};
+  MINUTE, HOUR, DAY, openInDubai, dubaiClock, sleep, clamp, isNum, round, money, pct, compact, timeAgo, dubaiTime, nyClock, marketState, sessionFraction, dayKey, isWeekday, moneyIn, isIntl, INTL };
 
 };
 
@@ -3556,7 +3713,7 @@ function createServer(engine) {
         return redirect(res, '/money?saved=1');
       }
       if (path === '/backtest') return send(res, 200, String(pages2.backtestPage({ engine, bt: engine.backtestNow() })));
-      if (path === '/watchlist') return send(res, 200, String(pages.watchlistPage({ engine, sort: url.searchParams.get('sort') ?? 'news' })));
+      if (path === '/watchlist') return send(res, 200, String(pages.watchlistPage({ engine, sort: url.searchParams.get('sort') ?? 'news', market: ['us', 'intl'].includes(url.searchParams.get('m')) ? url.searchParams.get('m') : 'all' })));
       if (path === '/scorecard') return send(res, 200, String(pages.scorecardPage({ engine })));
       if (path === '/status/test-telegram' && req.method === 'POST') {
         if (!fromThisSite(req)) return send(res, 403, 'Forbidden', 'text/plain');
@@ -3933,6 +4090,112 @@ module.exports = { recentForm4, readForm4, parseForm4Xml };
 
 };
 
+// ---------- sources/screen.js ----------
+__defs["sources/screen"] = (module, exports, require) => {
+// The site's own Shariah check for XTB stocks outside the US, where Zoya's plan has
+// no ratings. It follows the AAOIFI rules Zoya also uses:
+//   1. business: no conventional banking, insurance or finance, alcohol, tobacco, gambling
+//   2. debt under 30% of the company's market value
+//   3. cash and interest-bearing deposits under 30% of market value
+//   4. interest income under 5% of revenue
+// Market value = shares x the average price over the last year. Anything that
+// cannot be checked counts as NOT halal: no doubt.
+
+const YQ = 'https://query2.finance.yahoo.com';
+
+const HARAM_INDUSTRY = /\b(banks?|insurance|reinsurance|capital markets|asset management|credit services|mortgage finance|financial conglomerates|brewers|wineries|distillers|tobacco|gambling|casinos)\b/i;
+const HARAM_NAME = /\b(bank|bancorp|banco|bancaire|banque|insurance|assurance|assicurazioni|versicherung|brewery|brewing|brauerei|distillers|tobacco|casino|betting|lottery|lotto)\b/i;
+
+// XTB country code -> Yahoo exchange ending.
+const SUFFIX = { DE: 'DE', UK: 'L', FR: 'PA', ES: 'MC', IT: 'MI', NL: 'AS', PL: 'WA', PT: 'LS', BE: 'BR', CH: 'SW', DK: 'CO', SE: 'ST', NO: 'OL', FI: 'HE', CZ: 'PR', AT: 'VI', IE: 'IR' };
+
+function yahooSymbol(xtbSymbol, country) {
+  const suffix = SUFFIX[String(country).toUpperCase()];
+  if (!suffix) return null;
+  const base = String(xtbSymbol).toUpperCase().replace(new RegExp(`\\.${country}$`, 'i'), '');
+  if (!base) return null;
+  return `${base.replace(/\./g, '-')}.${suffix}`;
+}
+
+// Sector and industry from Yahoo's search (no key needed).
+async function profile(net, ysym) {
+  const body = await net.json(`${YQ}/v1/finance/search?q=${encodeURIComponent(ysym)}&quotesCount=5&newsCount=0&listsCount=0`, { timeout: 15000 });
+  const q = (body?.quotes ?? []).find((x) => String(x.symbol).toUpperCase() === ysym.toUpperCase());
+  if (!q) return null;
+  return { sector: q.sectorDisp ?? q.sector ?? null, industry: q.industryDisp ?? q.industry ?? null, name: q.longname ?? q.shortname ?? null, type: q.quoteType ?? null };
+}
+
+const TYPES = [
+  'TotalDebt', 'CashCashEquivalentsAndShortTermInvestments', 'CashAndCashEquivalents', 'OtherShortTermInvestments',
+  'TotalRevenue', 'OperatingRevenue', 'InterestIncome', 'InterestIncomeNonOperating', 'OrdinarySharesNumber', 'ShareIssued',
+];
+
+// The latest reported value of each figure (yearly, or the latest quarter for the balance sheet).
+async function financials(net, ysym, now = Date.now()) {
+  const types = [...TYPES.map((t) => `annual${t}`), 'quarterlyTotalDebt', 'quarterlyCashCashEquivalentsAndShortTermInvestments', 'quarterlyOrdinarySharesNumber'];
+  const p2 = Math.floor(now / 1000); const p1 = p2 - 4 * 365 * 86400;
+  const url = `${YQ}/ws/fundamentals-timeseries/v1/finance/timeseries/${encodeURIComponent(ysym)}?symbol=${encodeURIComponent(ysym)}&type=${types.join(',')}&period1=${p1}&period2=${p2}`;
+  const body = await net.json(url, { timeout: 20000 });
+  const out = {};
+  for (const r of body?.timeseries?.result ?? []) {
+    const type = r?.meta?.type?.[0];
+    const rows = (r?.[type] ?? []).filter((x) => x?.reportedValue && Number.isFinite(x.reportedValue.raw));
+    if (!type || !rows.length) continue;
+    const last = rows.sort((a, b) => String(a.asOfDate).localeCompare(String(b.asOfDate))).pop();
+    out[type] = { value: last.reportedValue.raw, currency: last.currencyCode ?? null, date: last.asOfDate };
+  }
+  const pick = (...names) => names.map((n) => out[n]).filter(Boolean).sort((a, b) => String(b.date).localeCompare(String(a.date)))[0] ?? null;
+  return {
+    debt: pick('quarterlyTotalDebt', 'annualTotalDebt'),
+    cash: pick('quarterlyCashCashEquivalentsAndShortTermInvestments', 'annualCashCashEquivalentsAndShortTermInvestments')
+      ?? (out.annualCashAndCashEquivalents ? { ...out.annualCashAndCashEquivalents, value: out.annualCashAndCashEquivalents.value + (out.annualOtherShortTermInvestments?.value ?? 0) } : null),
+    revenue: pick('annualTotalRevenue', 'annualOperatingRevenue'),
+    interest: pick('annualInterestIncome', 'annualInterestIncomeNonOperating'),
+    shares: pick('quarterlyOrdinarySharesNumber', 'annualOrdinarySharesNumber', 'annualShareIssued'),
+    found: Object.keys(out).length,
+  };
+}
+
+// The four AAOIFI tests. fx turns a figure's currency into the price's currency.
+function aaoifi({ prof, fin, avgPrice, priceCurrency, fx = () => 1 }) {
+  const checks = [];
+  const add = (key, title, ok, note) => checks.push({ key, title, status: ok === null ? 'na' : ok ? 'pass' : 'fail', note });
+  const industry = prof?.industry ?? null;
+  const name = prof?.name ?? '';
+  const badBusiness = (industry && HARAM_INDUSTRY.test(industry)) || HARAM_NAME.test(name);
+  add('business', 'Halal business', industry ? !badBusiness : (badBusiness ? false : null), industry ? `${prof.sector ? `${prof.sector} · ` : ''}${industry}` : 'Industry not found');
+
+  // Pence-quoted prices (London) are turned into pounds before comparing.
+  const unit = priceCurrency === 'GBp' || priceCurrency === 'GBX' ? 0.01 : 1;
+  const base = priceCurrency === 'GBp' || priceCurrency === 'GBX' ? 'GBP' : priceCurrency;
+  const conv = (fig) => (fig ? fig.value * (fig.currency && fig.currency !== base ? fx(fig.currency, base) : 1) : null);
+  const shares = fin?.shares?.value ?? null;
+  const cap = shares && avgPrice ? shares * avgPrice * unit : null;
+  const debt = conv(fin?.debt); const cash = conv(fin?.cash);
+  const revenue = conv(fin?.revenue); const interest = conv(fin?.interest);
+  const r = (a, b) => (Number.isFinite(a) && Number.isFinite(b) && b > 0 ? a / b : null);
+  const debtRatio = cap ? (debt === null ? null : r(debt, cap)) : null;
+  const cashRatio = cap ? (cash === null ? null : r(cash, cap)) : null;
+  const intRatio = revenue ? (interest === null ? null : r(Math.max(0, interest), revenue)) : null;
+  const pctText = (x) => `${(x * 100).toFixed(1)}%`;
+  add('debt', 'Debt under 30% of market value', debtRatio === null ? null : debtRatio < 0.3, debtRatio === null ? 'Not enough data' : pctText(debtRatio));
+  add('cash', 'Cash & deposits under 30% of market value', cashRatio === null ? null : cashRatio < 0.3, cashRatio === null ? 'Not enough data' : pctText(cashRatio));
+  // No interest figure reported: cash cannot earn more than about 6% a year, so if even
+  // that would stay under 5% of revenue, the test is passed (shown as an upper bound).
+  const bound = intRatio === null && cash !== null && revenue ? r(cash * 0.06, revenue) : null;
+  add('interest', 'Interest income under 5% of revenue', intRatio !== null ? intRatio < 0.05 : bound !== null && bound < 0.05 ? true : null,
+    intRatio !== null ? pctText(intRatio) : bound !== null && bound < 0.05 ? `at most ${pctText(bound)} (worked out from cash)` : 'Not enough data');
+
+  const failed = checks.filter((c) => c.status === 'fail');
+  const unknown = checks.filter((c) => c.status === 'na');
+  const status = failed.length ? 'FAIL' : unknown.length ? 'UNKNOWN' : 'PASS';
+  return { status, checks, ratios: { debt: debtRatio, cash: cashRatio, interest: intRatio }, marketCap: cap, currency: base, industry, sector: prof?.sector ?? null };
+}
+
+module.exports = { profile, financials, aaoifi, yahooSymbol, SUFFIX };
+
+};
+
 // ---------- sources/sec.js ----------
 __defs["sources/sec"] = (module, exports, require) => {
 // Official company data from the SEC (free): company numbers, recent filings
@@ -4214,14 +4477,30 @@ module.exports = { fetchWires, tickersOf, FEEDS };
 
 // ---------- sources/xtb.js ----------
 __defs["sources/xtb"] = (module, exports, require) => {
+const { yahooSymbol } = require('./screen');
+
 // The US stocks XTB sells as real shares (not CFDs), from XTB's UAE branch: the
 // same list the XTB app shows. A GitHub job copies it a few times a day (XTB's
 // website blocks Render); XTB's own website is the backup.
+// XTB's other stocks, turned into Yahoo symbols (AAL.UK -> AAL.L). Countries Yahoo
+// does not cover are left out.
+function intlOf(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const r of rows ?? []) {
+    const symbol = yahooSymbol(r.s, r.c);
+    if (!symbol || seen.has(symbol)) continue;
+    seen.add(symbol);
+    out.push({ symbol, xtb: r.s, country: r.c, currency: r.cur ?? null, name: r.n ?? '' });
+  }
+  return out;
+}
+
 async function fromMirror(net, config) {
   const body = await net.json(`${config.feedsBase}/xtb_us.json`, { timeout: 20000 });
   const symbols = (body?.symbols ?? []).map((s) => String(s).toUpperCase()).filter(Boolean);
   if (symbols.length < 200) throw new Error('mirror list too short');
-  return { symbols, branch: body.branch ?? null, updatedAt: body.updatedAt ?? null, source: 'GitHub copy of XTB list' };
+  return { symbols, intl: intlOf(body.intl), branch: body.branch ?? null, updatedAt: body.updatedAt ?? null, source: 'GitHub copy of XTB list' };
 }
 
 async function fromXtb(net, config) {
@@ -4237,7 +4516,9 @@ async function fromXtb(net, config) {
     .filter((i) => i.instrumentCountrySymbol === 'US' && !i.closeOnly)
     .map((i) => String(i.symbol).replace(/\.US$/i, '').toUpperCase()))];
   if (symbols.length < 200) throw new Error('XTB list too short');
-  return { symbols, branch: config.xtb.branch, updatedAt: new Date().toISOString(), source: 'XTB website (UAE branch)' };
+  const intl = intlOf(all.filter((i) => i.instrumentCountrySymbol && i.instrumentCountrySymbol !== 'US' && !i.closeOnly)
+    .map((i) => ({ s: i.symbol, c: i.instrumentCountrySymbol, cur: i.currencyCode, n: i.companyName || i.description || '' })));
+  return { symbols, intl, branch: config.xtb.branch, updatedAt: new Date().toISOString(), source: 'XTB website (UAE branch)' };
 }
 
 async function xtbList(net, config) {
@@ -4260,10 +4541,11 @@ module.exports = { xtbList };
 // ---------- sources/yahoo.js ----------
 __defs["sources/yahoo"] = (module, exports, require) => {
 // Free prices from Yahoo Finance's chart endpoints (no key needed).
-const { dayKey } = require('../lib/util');
+const { dayKey, isIntl } = require('../lib/util');
 
 const BASE = 'https://query1.finance.yahoo.com';
-const ySym = (symbol) => symbol.replace(/\./g, '-');
+// US class shares use a dash on Yahoo (BRK.B -> BRK-B); European symbols keep their exchange ending.
+const ySym = (symbol) => (isIntl(symbol) ? symbol : symbol.replace(/\./g, '-'));
 
 function toCandles(result) {
   const t = result?.timestamp ?? [];
@@ -4293,6 +4575,7 @@ async function chart(net, symbol, { range = '1y', interval = '1d' } = {}) {
     symbol,
     name: meta.longName || meta.shortName || symbol,
     exchange: meta.fullExchangeName || meta.exchangeName || '',
+    currency: meta.currency || 'USD',
     price: meta.regularMarketPrice ?? last?.c ?? null,
     volume: meta.regularMarketVolume ?? (lastIsToday ? last.v : 0),
     dayHigh: meta.regularMarketDayHigh ?? null,
@@ -4539,7 +4822,7 @@ module.exports = { FileStore, GitHubStore, createStore };
 // ---------- telegram.js ----------
 __defs["telegram"] = (module, exports, require) => {
 // Sends alerts to the owner's Telegram chat.
-const { money, pct, openInDubai } = require('./lib/util');
+const { money, pct, openInDubai, moneyIn, isIntl } = require('./lib/util');
 const { VERDICTS } = require('./analysis/plan');
 const { CATALYSTS } = require('./rules');
 const { tipFor } = require('./analysis/tips');
@@ -4547,6 +4830,10 @@ const { tipFor } = require('./analysis/tips');
 const ICON = { BUY_NOW: '🟢', WAIT_PULLBACK: '🟡', WAIT_BREAKOUT: '🔵', WATCH: '⚪', AVOID: '🔴' };
 
 function alertText(signal, config) {
+  return moneyIn(signal.currency ?? 'USD', () => alertTextIn(signal, config));
+}
+
+function alertTextIn(signal, config) {
   const v = VERDICTS[signal.verdict] ?? VERDICTS.WATCH;
   const l = signal.levels;
   const lines = [
@@ -4567,7 +4854,7 @@ function alertText(signal, config) {
     ...(signal.explain?.bad ?? []).slice(0, 2).map((b) => `❌ ${b.title}: ${b.note}`),
     signal.marketAt !== 'open' ? `🕒 Market closed now — plan is for the open at ${openInDubai()} Dubai.` : '',
     `📘 Tip: ${tipFor(signal, config).title} — ${tipFor(signal, config).text}`,
-    '✅ Halal (Zoya) · Real shares on XTB',
+    isIntl(signal.symbol) ? '✅ Halal (own AAOIFI check) · Real shares on XTB' : '✅ Halal (Zoya) · Real shares on XTB',
     `${config.siteUrl}/s/${encodeURIComponent(signal.symbol)}`,
   ];
   return lines.filter((x, i) => x !== '' || i === 2).join('\n');
@@ -5030,7 +5317,7 @@ module.exports = { chartSvg, intradaySvg };
 __defs["views/pages"] = (module, exports, require) => {
 // Every page of the site.
 const { html, raw, safeUrl } = require('../lib/html');
-const { money, pct, compact, timeAgo, dubaiTime, isNum, marketState, openInDubai, dayKey } = require('../lib/util');
+const { money, pct, compact, timeAgo, dubaiTime, isNum, marketState, openInDubai, dayKey, moneyIn, isIntl } = require('../lib/util');
 const { VERDICTS } = require('../analysis/plan');
 const { CATALYSTS } = require('../rules');
 const { chartSvg, intradaySvg } = require('./chart');
@@ -5072,7 +5359,7 @@ function layout({ title, active = '/', body, config, version = '', live = '' }) 
 <nav class="tabs">${NAV.map(([href, label]) => html`<a href="${href}" class="${href === active ? 'on' : ''}">${label}</a>`)}</nav>
 </div></header>
 <main><div class="wrap">${body}</div></main>
-<footer><div class="wrap">Personal tool, hidden from search engines. Halal ratings: Zoya (AAOIFI), only COMPLIANT stocks are shown. Real shares on XTB only, no CFDs. Prices may be delayed. This is not financial advice — every trade is your own decision.
+<footer><div class="wrap">Personal tool, hidden from search engines. Halal: US stocks rated COMPLIANT by Zoya; stocks outside the US pass the site's own AAOIFI check. Real shares on XTB only, no CFDs. Prices may be delayed. This is not financial advice — every trade is your own decision.
 ${config.requirePassword ? html`<form method="post" action="/logout" style="margin-top:10px"><button class="ghost" type="submit">Log out</button></form>` : ''}</div></footer>
 <div class="newpill" id="newpill">↻ New signal — tap to refresh</div>
 <script src="/app.js?v=${config.assetVersion}"></script>
@@ -5171,7 +5458,18 @@ function tipBox(sig, config) {
   return html`<div class="tip"><span class="ico">📘</span><span><b>Lesson: ${t.title}.</b> ${t.text}</span></div>`;
 }
 
-function signalCard(sig, { quote, ta, config, sotd = false }) {
+// Prices on a card are in the stock's own currency (€, £, p, ...).
+function signalCard(sig, opts) {
+  return raw(moneyIn(sig.currency ?? opts.quote?.currency ?? 'USD', () => String(signalCardIn(sig, opts))));
+}
+
+function halalChip(sig) {
+  return sig.halalBy === 'self' || isIntl(sig.symbol)
+    ? html`<span class="chip g" title="Passed the site's own AAOIFI check (no Zoya rating outside the US)">✓ Halal · own AAOIFI check</span>`
+    : html`<span class="chip g">✓ Halal</span>`;
+}
+
+function signalCardIn(sig, { quote, ta, config, sotd = false }) {
   const v = VERDICTS[sig.verdict] ?? VERDICTS.WATCH;
   const cat = CATALYSTS[sig.catalyst]?.label ?? 'News';
   const link = safeUrl(sig.url);
@@ -5192,7 +5490,7 @@ ${verdictPill(sig.verdict)}
 ${sig.atOpen ? html`<span class="chip">Moves at open</span>` : ''}
 ${sig.topBank ? html`<span class="chip b">🏦 ${sig.topBank}</span>` : ''}
 ${sig.buzz?.rising ? html`<span class="chip b" title="${sig.buzz.mentions} Reddit mentions vs ${sig.buzz.prev} a day ago">🔥 Reddit buzz rising</span>` : ''}
-<span class="chip g">✓ Halal</span><span class="chip g">✓ XTB shares</span>
+${halalChip(sig)}<span class="chip g">✓ XTB shares</span>
 <span class="chip">${sig.source} · ${timeAgo(sig.newsTime)}</span>
 </div>
 ${sig.others?.length ? html`<div class="small muted">Also good news: ${sig.others.slice(0, 3).map((o) => html`<span class="chip">${o.title.slice(0, 70)}${o.title.length > 70 ? '…' : ''}</span>`)}</div>` : ''}
@@ -5320,6 +5618,19 @@ ${items.length ? items.map((n) => {
 }
 
 function stockPage({ engine, data }) {
+  return moneyIn(data.quote?.currency ?? 'USD', () => stockPageIn({ engine, data }));
+}
+
+// The site's own AAOIFI check, shown for stocks outside the US.
+function screenBox(screen) {
+  if (!screen?.checks) return '';
+  const ico = { pass: '✓', fail: '✕', na: '?' };
+  return html`<h2>Halal check (own AAOIFI)</h2>
+<p class="section-note">Zoya has no rating for this stock on your plan, so the site checked it with the same AAOIFI rules, using the company's latest accounts. Checked ${timeAgo(screen.at)}.</p>
+<ul class="ten">${screen.checks.map((c) => html`<li class="${c.status}"><span class="ico">${ico[c.status]}</span><div><b>${c.title}</b><span class="why-line">${c.note}</span></div></li>`)}</ul>`;
+}
+
+function stockPageIn({ engine, data }) {
   const { config } = engine;
   const { symbol, quote, ta, info, sector, decision, signals, news, halal, earnings, latest } = data;
   const fund = info?.fund ?? {};
@@ -5334,7 +5645,7 @@ function stockPage({ engine, data }) {
 ${verdictPill(decision.kind)}
 ${latest ? html`<div class="headline">Latest good news: ${safeUrl(latest.url) ? html`<a href="${safeUrl(latest.url)}" target="_blank" rel="noopener noreferrer nofollow">${latest.title}</a>` : latest.title}</div><p class="why">${latest.why} <span class="dim">(${latest.source}, ${dubaiTime(latest.newsTime)})</span></p>` : ''}
 <div class="chips">
-<span class="chip g">✓ Halal — Zoya COMPLIANT</span>
+${data.screen ? html`<span class="chip g">✓ Halal — own AAOIFI check</span>` : html`<span class="chip g">✓ Halal — Zoya COMPLIANT</span>`}
 ${zoya?.reportDate ? html`<span class="chip">Report ${String(zoya.reportDate).slice(0, 10)}</span>` : ''}
 ${isNum(zoya?.purificationRatio) ? html`<span class="chip a">Purify ${pct(zoya.purificationRatio, 2, false)} of dividends</span>` : ''}
 <span class="chip g">✓ Real shares on XTB</span>
@@ -5343,6 +5654,7 @@ ${info?.dilution?.level === 'recent' ? html`<span class="chip r">Recent share sa
 </div>
 ${explodeBubble(decision.explode)}
 ${explainBox(decision.explain)}
+${screenBox(data.screen)}
 ${quote ? chartSvg({ candles: quote.candles, ta, levels: decision.levels, days: 130, height: 320, id: 'main' }) : html`<div class="chart-empty">No chart data.</div>`}
 <div class="legend"><span><i class="lg-ma20"></i>20-day avg</span><span><i class="lg-ma50"></i>50-day avg</span><span><i class="lg-sup"></i>support</span><span><i class="lg-res"></i>resistance</span><span><i class="lg-entry"></i>entry</span><span><i class="lg-stop"></i>stop</span><span><i class="lg-target"></i>target</span></div>
 ${decision.levels ? html`<h2>Trade plan</h2>${tradeStats(decision.levels, { rvol: ta?.rvol, avgVol: ta?.avgVol, gap: ta?.gapPct, float: decision.explode?.floatShares ?? null, shares: fund.sharesOut, mcap }, config)}${decision.kind !== 'AVOID' ? boughtForm(symbol, decision.levels.entry) : ''}` : ''}
@@ -5378,9 +5690,9 @@ ${signals.map((s) => html`<tr><td>${dubaiTime(s.createdAt)}</td><td>${VERDICTS[s
 `;
   return layout({ title: symbol, active: '', body, config, version: engine.version });
 }
-function watchlistPage({ engine, sort = 'news' }) {
+function watchlistPage({ engine, sort = 'news', market = 'all' }) {
   const { config } = engine;
-  const rows = engine.watchlist();
+  const rows = engine.watchlist().filter((r) => market === 'all' || (market === 'us' ? r.country === 'US' : r.country !== 'US'));
   const sorters = {
     news: (a, b) => (b.news ? Date.parse(b.news.time) : 0) - (a.news ? Date.parse(a.news.time) : 0) || (b.rvol ?? 0) - (a.rvol ?? 0),
     volume: (a, b) => (b.rvol ?? -1) - (a.rvol ?? -1),
@@ -5389,11 +5701,12 @@ function watchlistPage({ engine, sort = 'news' }) {
   };
   rows.sort(sorters[sort] ?? sorters.news);
   const body = html`<h1>Your halal stock list</h1>
-<p class="sub">${rows.length} stocks: Zoya COMPLIANT and real shares on XTB${Number.isFinite(config.maxPrice) ? `, priced up to ${money(config.maxPrice)}` : ', any price'}. Charts load in the background.</p>
-<div class="filters">${[['news', 'Latest news'], ['volume', 'Volume'], ['move', 'Today’s move'], ['symbol', 'A–Z']].map(([k, l]) => html`<a href="/watchlist?sort=${k}" class="${sort === k ? 'on' : ''}">${l}</a>`)}</div>
+<p class="sub">${rows.length} stocks, all sold as real shares on XTB: ${rows.filter((r) => r.country === 'US').length} US stocks rated COMPLIANT by Zoya, and ${rows.filter((r) => r.country !== 'US').length} from other countries that passed the site's own AAOIFI check. Charts load in the background.</p>
+<div class="filters">${[['all', 'All'], ['us', 'US'], ['intl', 'Outside the US']].map(([k, l]) => html`<a href="/watchlist?sort=${sort}&amp;m=${k}" class="${market === k ? 'on' : ''}">${l}</a>`)}</div>
+<div class="filters">${[['news', 'Latest news'], ['volume', 'Volume'], ['move', 'Today’s move'], ['symbol', 'A–Z']].map(([k, l]) => html`<a href="/watchlist?sort=${k}&amp;m=${market}" class="${sort === k ? 'on' : ''}">${l}</a>`)}</div>
 ${rows.length ? html`<div class="scroll"><table class="list"><tr><th>Stock</th><th>Price</th><th>Today</th><th>Vol×</th><th>Trend</th><th>To resistance</th><th>Last good news</th></tr>
-${rows.map((r) => html`<tr><td><a href="/s/${encodeURIComponent(r.symbol)}"><b>${r.symbol}</b></a><br><span class="dim small">${String(r.name).slice(0, 28)}</span></td>
-<td>${money(r.price)}</td><td>${isNum(r.changePct) ? changeSpan(r.changePct) : '–'}</td><td>${isNum(r.rvol) ? `${r.rvol.toFixed(1)}×` : '–'}</td>
+${rows.map((r) => html`<tr><td><a href="/s/${encodeURIComponent(r.symbol)}"><b>${r.symbol}</b></a>${r.country !== 'US' ? html` <span class="chip" title="Own AAOIFI check">${r.country}</span>` : ''}<br><span class="dim small">${String(r.name).slice(0, 28)}</span></td>
+<td>${money(r.price, r.currency ?? 'USD')}</td><td>${isNum(r.changePct) ? changeSpan(r.changePct) : '–'}</td><td>${isNum(r.rvol) ? `${r.rvol.toFixed(1)}×` : '–'}</td>
 <td><span class="chip ${r.trend === 'up' ? 'g' : r.trend === 'down' ? 'r' : ''}">${r.trend}</span></td>
 <td>${isNum(r.toResistance) ? pct(r.toResistance) : '–'}</td>
 <td class="small">${r.news ? html`${timeAgo(r.news.time)} · ${r.news.cls?.impact}/10` : html`<span class="dim">–</span>`}${r.earnings ? html`<br><span class="chip a">Earnings ${r.earnings}</span>` : ''}</td></tr>`)}
@@ -5424,8 +5737,8 @@ ${scored.length ? html`<div class="scroll"><table class="list"><tr><th>First ver
 ${groups.map(([k, label]) => { const list = scored.filter((s) => first(s) === k); if (!list.length) return ''; return html`<tr><td><b>${label}</b></td><td>${list.length}</td><td>${pct(share(list, (s) => s.outcome.hit10), 0, false)}</td><td>${pct(share(list, (s) => s.outcome.hit20), 0, false)}</td><td>${pct(share(list, (s) => s.outcome.stopped), 0, false)}</td><td>${isNum(avg(list, (s) => s.outcome.tradeReturn)) ? changeSpan(avg(list, (s) => s.outcome.tradeReturn)) : '–'}</td><td>${isNum(avg(list, (s) => s.outcome.maxGain)) ? changeSpan(avg(list, (s) => s.outcome.maxGain)) : '–'}</td></tr>`; })}
 </table></div>
 <h2>Recent signals</h2><div class="scroll"><table class="list"><tr><th>Stock</th><th>When</th><th>Verdict</th><th>Entry</th><th>1 day</th><th>5 days</th><th>Best</th><th>Result</th></tr>
-${scored.slice(0, 80).map((s) => html`<tr><td><a href="/s/${encodeURIComponent(s.symbol)}"><b>${s.symbol}</b></a></td><td class="small">${dubaiTime(s.createdAt)}</td><td>${VERDICTS[first(s)]?.label}</td><td>${money(s.outcome.entry)}</td>
-<td>${isNum(s.outcome.d1) ? changeSpan(s.outcome.d1) : '–'}</td><td>${isNum(s.outcome.d5) ? changeSpan(s.outcome.d5) : '–'}</td><td>${changeSpan(s.outcome.maxGain)}</td><td>${resultChip(s.outcome)}</td></tr>`)}
+${scored.slice(0, 80).map((s) => moneyIn(s.currency ?? 'USD', () => html`<tr><td><a href="/s/${encodeURIComponent(s.symbol)}"><b>${s.symbol}</b></a></td><td class="small">${dubaiTime(s.createdAt)}</td><td>${VERDICTS[first(s)]?.label}</td><td>${money(s.outcome.entry)}</td>
+<td>${isNum(s.outcome.d1) ? changeSpan(s.outcome.d1) : '–'}</td><td>${isNum(s.outcome.d5) ? changeSpan(s.outcome.d5) : '–'}</td><td>${changeSpan(s.outcome.maxGain)}</td><td>${resultChip(s.outcome)}</td></tr>`))}
 </table></div>` : html`<div class="empty">Results appear one trading day after the first signals.${engine.store.durable ? '' : ' Results are kept on the server and reset when the site restarts.'}</div>`}
 ${learnBox(engine)}
 <div class="chips" style="margin-top:18px"><a class="chip b" href="/paper">Paper trading results →</a><a class="chip b" href="/backtest">Backtest on a year of charts →</a></div>`;
@@ -5461,7 +5774,8 @@ function tradesPage({ engine, error = '' }) {
   const open = state.trades.filter((t) => t.status === 'open');
   const closed = state.trades.filter((t) => t.status === 'closed').slice(0, 60);
   const half = Math.round(config.halfGain * 100); const full = Math.round(config.targetGain * 100);
-  const plUsd = (t, exit) => (t.shares ? t.shares * (exit * (1 - fx) - t.entry * (1 + fx)) : null);
+  // Dollar and dirham profit only for US stocks (others are priced in their own currency).
+  const plUsd = (t, exit) => (t.shares && !isIntl(t.symbol) ? t.shares * (exit * (1 - fx) - t.entry * (1 + fx)) : null);
   const realized = closed.map((t) => plUsd(t, t.exit)).filter(isNum);
   const wins = closed.filter((t) => netResult(t.entry, t.exit, fx) > 0).length;
   const body = html`<h1>My trades</h1>
@@ -5477,7 +5791,7 @@ ${closed.length ? html`<div class="bubbles">
 <div class="bubble ${realized.reduce((a, b) => a + b, 0) >= 0 ? 'good' : 'bad'}"><div class="k">Profit after costs</div><div class="v" style="font-size:18px">${realized.length ? moneyBoth(realized.reduce((a, b) => a + b, 0), config) : '–'}</div><div class="small muted">${realized.length < closed.length ? 'trades with shares entered' : 'all closed trades'}</div></div>
 </div>` : ''}
 <h2>Open (${open.length})</h2>
-${open.length ? html`<div class="cards">${open.map((t) => {
+${open.length ? html`<div class="cards">${open.map((t) => moneyIn(engine.currencyOf(t.symbol), () => {
     const pl = t.last ? netResult(t.entry, t.last, fx) : null;
     const usd = t.last ? plUsd(t, t.last) : null;
     return html`<div class="card ${pl >= 0 ? 'buy' : ''}"><div class="card-head"><a class="tick" href="/s/${encodeURIComponent(t.symbol)}">${t.symbol}</a>
@@ -5486,9 +5800,9 @@ ${open.length ? html`<div class="cards">${open.map((t) => {
 <div class="grid">${stat('Bought at', money(t.entry))}${stat(t.half ? 'Stop (moved to entry)' : 'Stop', money(t.stop), 'r')}${stat(`Sell half (+${half}%)`, money(t.t1), t.half ? 'g' : '')}${stat(`Sell rest (+${full}%)`, money(t.t2), 'g')}${isNum(usd) ? stat('Profit now', moneyBoth(usd, config), usd >= 0 ? 'g' : 'r') : ''}</div>
 <div class="card-foot"><form method="post" action="/trades/close" class="bought"><input type="hidden" name="id" value="${t.id}"><label class="small muted">Sold at</label><input type="number" name="price" step="any" min="0" value="${t.last ? Number(t.last.toFixed(4)) : ''}"><button type="submit" class="ghost">Close trade</button></form>
 <form method="post" action="/trades/delete"><input type="hidden" name="id" value="${t.id}"><button type="submit" class="ghost">Delete</button></form></div></div>`;
-  })}</div>` : html`<div class="empty">No open trades. Tap “I bought this” on a signal, or add one above.</div>`}
+  }))}</div>` : html`<div class="empty">No open trades. Tap “I bought this” on a signal, or add one above.</div>`}
 ${closed.length ? html`<h2>Closed</h2><div class="scroll"><table class="list"><tr><th>Stock</th><th>Bought</th><th>Sold</th><th>Result after costs</th><th>Profit</th><th>Dates</th></tr>
-${closed.map((t) => html`<tr><td><b>${t.symbol}</b></td><td>${money(t.entry)}</td><td>${money(t.exit)}</td><td>${changeSpan(netResult(t.entry, t.exit, fx))}</td><td class="small">${t.shares ? moneyBoth(plUsd(t, t.exit), config) : html`<span class="dim">add shares to see</span>`}</td><td class="small dim">${t.date} → ${String(t.closedAt).slice(0, 10)}</td></tr>`)}</table></div>` : ''}
+${closed.map((t) => moneyIn(engine.currencyOf(t.symbol), () => html`<tr><td><b>${t.symbol}</b></td><td>${money(t.entry)}</td><td>${money(t.exit)}</td><td>${changeSpan(netResult(t.entry, t.exit, fx))}</td><td class="small">${isIntl(t.symbol) ? html`<span class="dim">in ${engine.currencyOf(t.symbol)}</span>` : t.shares ? moneyBoth(plUsd(t, t.exit), config) : html`<span class="dim">add shares to see</span>`}</td><td class="small dim">${t.date} → ${String(t.closedAt).slice(0, 10)}</td></tr>`))}</table></div>` : ''}
 <p class="small muted">Halal reminder: if a stock paid you a dividend, part of it may need to be given to charity. <a href="/money">Purification & zakat calculator →</a></p>`;
   return layout({ title: 'My trades', active: '/trades', body, config, version: engine.version });
 }
@@ -5500,7 +5814,7 @@ function guidePage({ engine }) {
   const body = html`<h1>How it works</h1>
 <p class="sub">What the site looks for, and why. The news is the trigger; everything else decides whether the trade is worth taking.</p>
 <div class="guide">
-<div class="bubble"><h3>1. Only halal, only real shares</h3><p>Every stock must be rated <b>COMPLIANT</b> by Zoya (AAOIFI rules; "questionable" is left out) and sold as a <b>real share on XTB</b> — CFDs are not used because most scholars do not consider them halal. ${Number.isFinite(config.maxPrice) ? `Price up to ${money(config.maxPrice)}.` : 'Any price.'}</p></div>
+<div class="bubble"><h3>1. Only halal, only real shares</h3><p>US stocks must be rated <b>COMPLIANT</b> by Zoya (AAOIFI rules; "questionable" is left out). XTB's stocks outside the US (UK, Germany, France and more) have no Zoya rating on your plan, so the site checks them itself with the same AAOIFI rules: a halal business, debt and cash each under 30% of market value, interest income under 5% of revenue — any test it cannot check counts as a fail. Every stock must be sold as a <b>real share on XTB</b> — CFDs are not used because most scholars do not consider them halal. ${Number.isFinite(config.maxPrice) ? `Price up to ${money(config.maxPrice)}.` : 'Any price.'}</p></div>
 <div class="bubble"><h3>2. Only good news that lasts</h3><p>Claude reads every headline and scores it 1–10. Only good news scoring <b>${config.minImpact}+</b> whose effect lasts <b>days or longer</b> becomes a signal. Ignored: share sales, reverse splits, conferences, lawsuits adverts, hype that fades the same day. Strongest: FDA approval, positive trial data, raised guidance, contracts that are big for the company's size, partnerships with big names, and insiders buying over ${money(config.insiderMin)} of their own shares.</p></div>
 <div class="bubble"><h3>3. What makes a stock explode</h3><p>The <b>explosion check</b> scores 10 signs. 7+ = explosive setup.</p>${explodeList(sample)}</div>
 <div class="bubble"><h3>4. Your 10-point check</h3><p>Fundamentals & catalyst · Technicals · Valuation · Earnings & revenue growth · Balance sheet & cash flow · Industry/sector · Competitive position · Institutional activity & sentiment (from volume) · Risk to reward · Macro/market cycle. Each gets ✓ pass, ! caution, ✕ fail or – no data, with the reason.</p></div>
@@ -5545,6 +5859,7 @@ ${setupBox(engine.setupStatus())}
 <div class="bubble"><div class="k">XTB US real shares</div><div class="v">${state.xtb.symbols.length}</div><div class="small muted">${state.xtb.updatedAt ? timeAgo(state.xtb.updatedAt) : 'not loaded'}</div></div>
 <div class="bubble"><div class="k">Zoya COMPLIANT</div><div class="v">${state.halal.count ?? 0}</div><div class="small muted">${state.halal.updatedAt ? timeAgo(state.halal.updatedAt) : 'not loaded'}</div></div>
 <div class="bubble"><div class="k">Halal + XTB + price</div><div class="v">${state.universe.symbols.length}</div><div class="small muted">${state.universe.candidates ?? 0} before price filter</div></div>
+<div class="bubble"><div class="k">Outside the US (own check)</div><div class="v">${Object.values(state.intl?.screens ?? {}).filter((x) => x.status === 'PASS').length}</div><div class="small muted">halal of ${Object.keys(state.intl?.screens ?? {}).length} checked · ${state.intl?.list?.length ?? 0} on XTB</div></div>
 <div class="bubble"><div class="k">Claude reads today</div><div class="v">${state.ai.count ?? 0}</div><div class="small muted">limit ${config.ai.dailyLimit}</div></div>
 <div class="bubble ${config.alpaca.feed === 'sip' ? 'good' : ''}"><div class="k">Price feed</div><div class="v" style="font-size:18px">${config.alpaca.feed === 'sip' ? 'Real time (SIP)' : 'Free (delayed)'}</div><div class="small muted">${config.alpaca.feed === 'sip' ? 'Alpaca Algo Trader Plus' : 'Set ALPACA_FEED=sip after upgrading Alpaca'}</div></div>
 </div>
@@ -5643,7 +5958,7 @@ ${alerts.map((a) => html`<tr><td><b>${a.symbol}</b></td><td class="small">${duba
   return layout({ title: 'Penny scalps', active: '/penny', body, config, version: engine.version, live: 'penny' });
 }
 
-module.exports = { verdictPill, changeSpan, stat, netResult, moneyBoth, pennyPage, layout, loginPage, homePage, newsPage, stockPage, watchlistPage, scorecardPage, statusPage, notFoundPage, tradesPage, guidePage };
+module.exports = { signalCard, verdictPill, changeSpan, stat, netResult, moneyBoth, pennyPage, layout, loginPage, homePage, newsPage, stockPage, watchlistPage, scorecardPage, statusPage, notFoundPage, tradesPage, guidePage };
 
 };
 
@@ -5651,7 +5966,7 @@ module.exports = { verdictPill, changeSpan, stat, netResult, moneyBoth, pennyPag
 __defs["views/pages2"] = (module, exports, require) => {
 // The newer pages: earnings & FDA plays, paper trading, zakat & purification, backtest.
 const { html, raw, safeUrl } = require('../lib/html');
-const { money, pct, isNum, timeAgo, dubaiTime } = require('../lib/util');
+const { money, pct, isNum, timeAgo, dubaiTime, moneyIn } = require('../lib/util');
 const { layout, changeSpan, stat } = require('./pages');
 const { STATUS } = require('../features/events');
 const { paperStats, paperCurve } = require('../features/paper');
@@ -5754,9 +6069,9 @@ ${kinds.map((k) => html`<div class="bubble"><div class="k">${k.label}</div><div 
 ${curve.length >= 2 ? html`<h2>Running total</h2>${raw(curveSvg(curve))}` : ''}
 <h2>Open (${p.positions.length})</h2>
 ${p.positions.length ? html`<div class="scroll"><table class="list"><tr><th>Stock</th><th>Kind</th><th>Bought</th><th>Now</th><th>Stop</th><th>Targets</th><th>Since</th></tr>
-${p.positions.map((t) => html`<tr><td><a href="/s/${encodeURIComponent(t.symbol)}"><b>${t.symbol}</b></a></td><td>${t.kind === 'scalp' ? 'Scalp' : 'Swing'}${t.status === 'pending' ? html` <span class="chip a">buys at the open</span>` : ''}</td><td>${money(t.entry)}</td><td>${t.last ? html`${money(t.last)} ${changeSpan(t.last / t.entry - 1)}` : '–'}</td><td>${money(t.stop)}</td><td class="small">${money(t.t1)}${t.half ? ' ✓' : ''} · ${money(t.t2)}</td><td class="small dim">${dubaiTime(t.openedAt)}</td></tr>`)}</table></div>` : html`<div class="empty">Nothing open. The next BUY NOW is taken automatically.</div>`}
+${p.positions.map((t) => moneyIn(engine.currencyOf(t.symbol), () => html`<tr><td><a href="/s/${encodeURIComponent(t.symbol)}"><b>${t.symbol}</b></a></td><td>${t.kind === 'scalp' ? 'Scalp' : 'Swing'}${t.status === 'pending' ? html` <span class="chip a">buys at the open</span>` : ''}</td><td>${money(t.entry)}</td><td>${t.last ? html`${money(t.last)} ${changeSpan(t.last / t.entry - 1)}` : '–'}</td><td>${money(t.stop)}</td><td class="small">${money(t.t1)}${t.half ? ' ✓' : ''} · ${money(t.t2)}</td><td class="small dim">${dubaiTime(t.openedAt)}</td></tr>`))}</table></div>` : html`<div class="empty">Nothing open. The next BUY NOW is taken automatically.</div>`}
 ${p.closed.length ? html`<h2>Closed</h2><div class="scroll"><table class="list"><tr><th>Stock</th><th>Kind</th><th>Bought</th><th>Sold</th><th>Result</th><th>How</th><th>Closed</th></tr>
-${p.closed.slice(0, 80).map((t) => { const [tone, label] = RESULT[t.result] ?? ['', t.result]; return html`<tr><td><b>${t.symbol}</b></td><td>${t.kind === 'scalp' ? 'Scalp' : 'Swing'}</td><td>${money(t.entry)}</td><td>${money(t.exit)}${t.half ? html`<br><span class="small dim">half at ${money(t.half)}</span>` : ''}</td><td>${changeSpan(t.ret)}</td><td><span class="chip ${tone}">${label}</span></td><td class="small dim">${dubaiTime(t.exitAt)}</td></tr>`; })}</table></div>` : ''}
+${p.closed.slice(0, 80).map((t) => moneyIn(engine.currencyOf(t.symbol), () => { const [tone, label] = RESULT[t.result] ?? ['', t.result]; return html`<tr><td><b>${t.symbol}</b></td><td>${t.kind === 'scalp' ? 'Scalp' : 'Swing'}</td><td>${money(t.entry)}</td><td>${money(t.exit)}${t.half ? html`<br><span class="small dim">half at ${money(t.half)}</span>` : ''}</td><td>${changeSpan(t.ret)}</td><td><span class="chip ${tone}">${label}</span></td><td class="small dim">${dubaiTime(t.exitAt)}</td></tr>`; }))}</table></div>` : ''}
 ${all.best ? html`<p class="small muted">Best: ${all.best.symbol} ${pct(all.best.ret)} · Worst: ${all.worst.symbol} ${pct(all.worst.ret)}</p>` : ''}
 <form method="post" action="/paper/reset" style="margin-top:20px"><button class="ghost" type="submit">Start paper trading again from zero</button></form>`;
   return layout({ title: 'Paper trading', active: '/paper', body, config, version: engine.version });
