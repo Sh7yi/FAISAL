@@ -293,7 +293,7 @@ function tenPoint({ cls, ta, fund, market, sector, levels, config }) {
   const items = [];
   const add = (key, title, status, note) => items.push({ key, title, status, note });
 
-  add('catalyst', 'Fundamentals & catalyst', cls.impact >= 7 ? 'pass' : cls.impact >= 5 ? 'warn' : 'fail',
+  add('catalyst', 'Fundamentals & catalyst', cls.impact >= (config.minImpact ?? 8) ? 'pass' : cls.impact >= 5 ? 'warn' : 'fail',
     `${CATALYSTS[cls.catalyst]?.label ?? 'News'} — impact ${cls.impact}/10, effect lasts ${cls.horizon}.`);
 
   if (ta) {
@@ -842,7 +842,8 @@ function loadConfig(env = process.env) {
       t2: num(env.SCALP_TARGET2, 0.1),
       alertScore: num(env.SCALP_ALERT_SCORE, 8),
     },
-    minImpact: num(env.MIN_IMPACT, 7),
+    // News must score at least this out of 10 to become a signal (raised from 7 to 8).
+    minImpact: num(env.MIN_IMPACT, 8),
     targetGain: num(env.TARGET_GAIN, 0.2),
     newsSeconds: num(env.NEWS_SECONDS, 60),
     runCollector: env.RUN_COLLECTOR !== 'false',
@@ -2694,7 +2695,7 @@ const mixin = {
 
   // The impact a piece of news needs before it becomes a signal.
   minImpactFor(catalyst, adj = this.state.learn?.byCatalyst?.[catalyst]?.adj ?? 0) {
-    return clamp(this.config.minImpact + adj, 6, 9);
+    return clamp(this.config.minImpact + adj, this.config.minImpact, 10);
   },
 
   scalpAlertScore() {
