@@ -1180,7 +1180,7 @@ class Engine {
     loop(() => this.scanScalps(), MINUTE, 'scalp');
     loop(() => this.pollBuzz(), 15 * MINUTE, 'buzz');
     loop(() => this.scanEvents(), 30 * MINUTE, 'events');
-    loop(() => this.screenIntl(), MINUTE, 'intl-screen');
+    loop(() => this.screenIntl(Date.now(), 8), MINUTE, 'intl-screen');
     loop(() => this.pollIntlNews(), MINUTE, 'intl-news');
     // Opening our own address counts as a visit, so Render never puts the site to sleep.
     loop(() => this.net.request(`${this.config.siteUrl}/health`, { timeout: 30000, retries: 0 }).catch(() => {}), 10 * MINUTE, 'awake');
@@ -1199,7 +1199,7 @@ class Engine {
     const now = Date.now();
     const s = this.state;
     // Reload twice a day, and at once if the saved list came from a different XTB list.
-    if (!s.xtb.symbols.length || s.xtb.branch !== this.config.xtb.branch || now - Date.parse(s.xtb.updatedAt ?? 0) > 12 * HOUR) {
+    if (!s.xtb.symbols.length || s.xtb.branch !== this.config.xtb.branch || !s.intl?.list?.length || now - Date.parse(s.xtb.updatedAt ?? 0) > 12 * HOUR) {
       try {
         const list = await xtbList(this.net, this.config);
         s.xtb = { symbols: [...new Set([...list.symbols, ...this.config.xtb.extra])], updatedAt: new Date().toISOString(), source: list.source, branch: list.branch ?? null };
