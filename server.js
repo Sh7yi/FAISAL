@@ -1604,7 +1604,7 @@ class Engine {
       strength: decision.strength,
       buzz: this.buzzFor(item.symbol),
       // Smart-money footprints on the last finished day, and how each did in the strategy lab.
-      footprints: [...this.setupsFor(item.symbol, quote?.candles ?? [], now.getTime()).map((f) => ({ setup: f.setup, name: f.short, on: f.on, verdict: f.result?.verdict?.key ?? null })),
+      footprints: [...this.setupsFor(item.symbol, quote?.candles ?? [], now.getTime()).map((f) => ({ setup: f.setup, name: f.short, on: f.on, verdict: f.result?.verdict?.key ?? null, exit: f.result?.exitName ?? null })),
         ...(item.smart ? [{ setup: item.smart, name: require('./features/lab').SETUPS[item.smart]?.short ?? item.smart, on: this.labOn(item.smart), verdict: this.state.lab?.results?.[item.smart]?.verdict?.key ?? null, filing: true }] : [])],
       topBank: item.cls.topBank ?? null,
       shorted: this.heavyShort(item.symbol),
@@ -3794,6 +3794,13 @@ const mixin = {
     for (const r of (ev.drift ?? []).filter((x) => x.status === 'ready').slice(0, 2)) evLines.push(`• Drift $${r.symbol}: jumped ${pct(r.move ?? r.gap)} on results and holding`);
     if (evLines.length) lines.push('', 'Calendar plays:', ...evLines);
 
+    // Smart-money setups that the strategy lab proved on unseen data (US stocks open now).
+    const smart = (this.labToday ? this.labToday(now.getTime()) : []).filter((r) => r.on).slice(0, 5);
+    if (smart.length) {
+      lines.push('', '🐋 Smart-money setups (proven in the strategy lab, buy at the open):');
+      for (const r of smart) lines.push(`• $${r.symbol} — ${r.result?.short ?? r.setup}${r.note ? ` (${r.note})` : ''} · lab: ${pct(r.result?.outSample?.avgAdj ?? 0)} vs market a trade · exit: ${r.result?.exitName ?? 'site plan'}`);
+    }
+
     if (s.movers.day === today && s.movers.list.length) {
       lines.push('', 'Moving pre-market with no news found (watch only):');
       for (const mv of s.movers.list.slice(0, 4)) lines.push(`• $${mv.symbol} ${pct(mv.change)}`);
@@ -5864,7 +5871,7 @@ function alertTextIn(signal, config) {
     signal.topBank ? `🏦 Upgrade from a top bank: ${signal.topBank}` : '',
     signal.buzz?.rising ? `🔥 Reddit buzz rising: ${signal.buzz.mentions} mentions vs ${signal.buzz.prev} a day ago` : '',
     signal.shorted ? `⚠ Heavy short selling: ${Math.round(signal.shorted.ratio * 100)}% of volume on ${signal.shorted.day} — short sellers are betting against it` : '',
-    (signal.footprints ?? []).some((f) => f.on) ? `🐋 Smart money: ${(signal.footprints ?? []).filter((f) => f.on).map((f) => f.name).join(', ')} (proven in the strategy lab)` : '',
+    (signal.footprints ?? []).some((f) => f.on) ? `🐋 Smart money: ${(signal.footprints ?? []).filter((f) => f.on).map((f) => `${f.name}${f.exit ? ` — lab exit: ${f.exit}` : ''}`).join('; ')} (proven in the strategy lab)` : '',
     `📋 10-point check ${signal.ten?.score ?? '?'}/10 · 💥 explosion check ${signal.explode?.score ?? '?'}/10 (${signal.explode?.label ?? ''})`,
     l ? `🎯 Entry ${money(l.entry)} · Stop ${money(l.stop)}` : '',
     l ? `💰 Sell half ${money(l.target1)} (+${Math.round(config.halfGain * 100)}%), then stop → entry · Sell rest ${money(l.target2)} (+${Math.round(config.targetGain * 100)}%)` : '',
