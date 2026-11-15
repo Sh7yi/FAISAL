@@ -1196,10 +1196,11 @@ class Engine {
   async refreshLists() {
     const now = Date.now();
     const s = this.state;
-    if (!s.xtb.symbols.length || now - Date.parse(s.xtb.updatedAt ?? 0) > 3 * DAY) {
+    // Reload twice a day, and at once if the saved list came from a different XTB list.
+    if (!s.xtb.symbols.length || s.xtb.branch !== this.config.xtb.branch || now - Date.parse(s.xtb.updatedAt ?? 0) > 12 * HOUR) {
       try {
         const list = await xtbList(this.net, this.config);
-        s.xtb = { symbols: [...new Set([...list.symbols, ...this.config.xtb.extra])], updatedAt: new Date().toISOString(), source: list.source };
+        s.xtb = { symbols: [...new Set([...list.symbols, ...this.config.xtb.extra])], updatedAt: new Date().toISOString(), source: list.source, branch: list.branch ?? null };
         this.net.mark('XTB stock list', true, `${s.xtb.symbols.length} US real shares (${list.source})`);
         this.touch();
       } catch (error) {
