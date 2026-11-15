@@ -2313,7 +2313,7 @@ class Engine {
 }
 
 // The extra features live in their own files and are added to the engine here.
-Object.assign(Engine.prototype, require('./features/intl').mixin, require('./features/events').mixin, require('./features/paper').mixin, require('./features/learn').mixin, require('./features/reports').mixin, require('./features/backtest').mixin, require('./features/lab').mixin, require('./features/pennylab').mixin);
+Object.assign(Engine.prototype, require('./features/intl').mixin, require('./features/events').mixin, require('./features/paper').mixin, require('./features/learn').mixin, require('./features/reports').mixin, require('./features/backtest').mixin, require('./features/lab').mixin, require('./features/pennylab').mixin, require('./features/newslab').mixin);
 
 module.exports = { Engine, emptyState };
 
@@ -3205,10 +3205,12 @@ const mixin = {
     if (!this.state.smartHistory?.events && process.uptime() < 2 * 3600) return;
     if (!quiet || (last && now - last < 7 * DAY)) {
       if (!this.state.pennyLab && this.labGappers?.length) await this.runPennyLab(now);
+      if (quiet && this.runNewsLab && (!this.state.newsLab || now - Date.parse(this.state.newsLab.at) > 7 * DAY)) await this.runNewsLab(now);
       return;
     }
     await this.runLab(now);
     await this.runPennyLab(now);
+    if (this.runNewsLab) await this.runNewsLab(now);
   },
 
   labOn(setup) {
@@ -3325,6 +3327,186 @@ const mixin = {
 };
 
 module.exports = { mixin, judge, MIN_SAMPLES };
+
+};
+
+// ---------- features/newslab.js ----------
+__defs["features/newslab"] = (module, exports, require) => {
+// The news lab: the site's main strategy tested on two years of real headlines.
+// Every Benzinga headline on a US halal stock (Alpaca's free news history) is read
+// by the same built-in rules the site uses before Claude, and every piece of good
+// news rated 8/10 or more is traded on the daily chart:
+//  - news before the open: bought at that day's open;
+//  - news during the session: bought at that day's close (after the first reaction);
+//  - news after the close: bought at the next open.
+// The filter and exit are chosen on the first year and judged on the second, with
+// the same costs and market comparison as the strategy lab.
+// Claude reads the live news; for two years of history the built-in rules stand in
+// (they catch the clearest catalysts: FDA approvals, trial wins, raised guidance,
+// big contracts with a dollar figure), so this tests the core of the strategy.
+const alpaca = require('../sources/alpaca');
+const yahoo = require('../sources/yahoo');
+const { ruleClassify, upgradeCheck, CATALYSTS } = require('../rules');
+const { DAY, sleep, dayKey, nyClock, isIntl } = require('../lib/util');
+const { EXITS, runTrade, summarize, verdict, spreadOf, prepare } = require('./lab');
+
+const FILTERS = {
+  all8: { name: 'Every 8/10+ good news', min: 8, test: () => true },
+  fresh8: { name: '8/10+, not already up 20%+ when bought', min: 8, test: (x) => x.move < 0.2 },
+  trend8: { name: '8/10+, not chased, and above the 20-day average', min: 8, test: (x) => x.move < 0.2 && x.above20 },
+  all7: { name: 'Every 7/10+ good news (a lower bar, for comparison)', min: 7, test: () => true },
+};
+
+function entryOf(candles, time) {
+  const t = Date.parse(time);
+  const ny = nyClock(new Date(t));
+  const day = ny.date;
+  const i = candles.findIndex((c) => dayKey(c.t) >= day);
+  if (i < 1) return null;
+  const same = dayKey(candles[i].t) === day;
+  if (!same || ny.minutes < 9 * 60 + 30) return { i, price: candles[i].o, at: 'open', buyIdx: i, useOpen: true };
+  if (ny.minutes < 16 * 60) return { i, price: candles[i].c, at: 'close', buyIdx: i, useOpen: false };
+  return candles[i + 1] ? { i: i + 1, price: candles[i + 1].o, at: 'next open', buyIdx: i + 1, useOpen: true } : null;
+}
+
+const mixin = {
+  async runNewsLab(now = new Date(), { pause = 350, batchSize = 15, maxPagesPerBatch = 200 } = {}) {
+    if (!alpaca.enabled(this.config)) { this.state.newsLab = { at: new Date().toISOString(), skipped: 'Alpaca keys are not set on Render.' }; return null; }
+    if (this.newsLabBusy) return null;
+    this.newsLabBusy = true;
+    const started = Date.now();
+    try {
+      const symbols = this.state.universe.symbols.filter((s) => !isIntl(s));
+      const set = new Set(symbols);
+      const start = new Date(now.getTime() - 730 * DAY);
+      const events = new Map(); // symbol -> [{ time, impact, catalyst, title }]
+      let headlines = 0; let pages = 0;
+      for (let b = 0; b < symbols.length; b += batchSize) {
+        const batch = symbols.slice(b, b + batchSize);
+        let items = [];
+        try {
+          items = await alpaca.news(this.net, this.config, { start, end: now, pages: maxPagesPerBatch, symbols: batch, limit: 50, gap: pause });
+        } catch { continue; }
+        pages += Math.ceil(items.length / 50);
+        for (const n of items) {
+          headlines++;
+          let cls = ruleClassify(n.title, n.summary);
+          cls = upgradeCheck(cls, n.title, n.summary);
+          if (!cls.good || cls.impact < 7 || cls.horizon === 'hours') continue;
+          for (const sym of n.symbols) {
+            if (!set.has(sym)) continue;
+            // News naming many companies is rarely about this one.
+            if (n.symbols.length > 3) continue;
+            if (!events.has(sym)) events.set(sym, []);
+            events.get(sym).push({ time: n.time, impact: cls.impact, catalyst: cls.catalyst, flags: cls.red_flags, title: n.title.slice(0, 120) });
+          }
+        }
+        if (pause) await sleep(pause);
+      }
+      // First report only: the same kind of news on the same stock within 3 days is one event.
+      for (const [sym, list] of events) {
+        list.sort((a, b) => a.time.localeCompare(b.time));
+        const keep = [];
+        for (const e of list) if (!keep.some((k) => k.catalyst === e.catalyst && Date.parse(e.time) - Date.parse(k.time) < 3 * DAY)) keep.push(e);
+        events.set(sym, keep);
+      }
+      const bench = new Map();
+      try {
+        const q = await yahoo.chart(this.net, 'IWM', { range: '2y', interval: '1d' });
+        for (const c of q.candles) bench.set(dayKey(c.t), c.c);
+      } catch { /* raw results only */ }
+      const split = dayKey(now.getTime() - 365 * DAY);
+      const trades = {};
+      for (const fk of Object.keys(FILTERS)) { trades[fk] = {}; for (const xk of Object.keys(EXITS)) trades[fk][xk] = []; }
+      const samples = [];
+      let tested = 0;
+      for (const [sym, list] of events) {
+        if (!list.length) continue;
+        let q;
+        try { q = await yahoo.chart(this.net, sym, { range: '2y', interval: '1d' }); } catch { continue; }
+        const c = (q.candles ?? []).filter((d) => d.o > 0 && d.c > 0 && d.h >= d.l);
+        if (c.length && dayKey(c[c.length - 1].t) === dayKey(now) && now - c[c.length - 1].t < 7 * 3600e3) c.pop();
+        if (c.length < 40) continue;
+        tested++;
+        const x = prepare(c);
+        let lastIdx = -99;
+        for (const ev of list) {
+          const en = entryOf(c, ev.time);
+          if (!en || en.buyIdx < 21 || en.buyIdx - lastIdx < 5) continue;
+          lastIdx = en.buyIdx;
+          const prevClose = c[en.i - 1].c;
+          const move = en.price / prevClose - 1;
+          const ma20 = c.slice(en.i - 20, en.i).reduce((a, d) => a + d.c, 0) / 20;
+          const info = { move, above20: prevClose > ma20 };
+          const cost = spreadOf(c, en.i - 1) / 2;
+          const atr = x.atr14(en.i - 1) ?? prevClose * 0.05;
+          for (const [xk, exit] of Object.entries(EXITS)) {
+            // Bought at the close: the trade starts the next day, entry = that close.
+            let tr;
+            if (en.useOpen) tr = runTrade(c, en.buyIdx, exit, cost, atr);
+            else {
+              // A flat placeholder day at the close price, then the real days: a gap the next
+              // morning still hits the stop at the open.
+              if (!c[en.buyIdx + 1]) continue;
+              tr = runTrade([...c.slice(0, en.buyIdx + 1), { ...c[en.buyIdx], t: c[en.buyIdx].t, o: c[en.buyIdx].c, h: c[en.buyIdx].c, l: c[en.buyIdx].c }, ...c.slice(en.buyIdx + 1)], en.buyIdx + 1, { ...exit, days: exit.days + 1 }, cost, atr);
+              if (tr && !tr.open) tr.exitIdx = Math.max(en.buyIdx, tr.exitIdx - 1);
+            }
+            if (!tr || tr.open) continue;
+            const day0 = dayKey(c[en.buyIdx].t);
+            const b0 = bench.get(day0); const b1 = bench.get(dayKey(c[Math.min(tr.exitIdx, c.length - 1)].t));
+            const mkt = b0 && b1 ? b1 / b0 - 1 : 0;
+            const row = { net: tr.net, adj: tr.net - mkt, mfe: tr.mfe, mae: tr.mae, days: tr.days, reason: tr.reason, day: day0, symbol: sym, catalyst: ev.catalyst, impact: ev.impact, move };
+            for (const [fk, f] of Object.entries(FILTERS)) if (ev.impact >= f.min && f.test(info)) trades[fk][xk].push(row);
+            if (xk === 'site' && ev.impact >= 8 && samples.length < 400) samples.push({ ...row, title: ev.title, at: en.at });
+          }
+        }
+        if (pause) await sleep(Math.round(pause / 2));
+      }
+      let best = null;
+      const grid = {};
+      for (const fk of Object.keys(FILTERS)) {
+        grid[fk] = {};
+        for (const xk of Object.keys(EXITS)) {
+          const ins = summarize(trades[fk][xk].filter((t) => t.day < split));
+          const oos = summarize(trades[fk][xk].filter((t) => t.day >= split));
+          grid[fk][xk] = { inSample: ins, outSample: oos };
+          // The 7/10 row is only a comparison; the site's bar stays at 8.
+          if (fk !== 'all7' && ins.n >= 20 && (!best || ins.avgAdj > best.ins.avgAdj)) best = { fk, xk, ins };
+        }
+      }
+      const fk = best?.fk ?? 'all8'; const xk = best?.xk ?? 'site';
+      const unseen = trades[fk][xk].filter((t) => t.day >= split);
+      const byCatalyst = {};
+      for (const t of trades.all8[xk]) (byCatalyst[t.catalyst] ??= []).push(t);
+      const lab = {
+        at: new Date().toISOString(),
+        seconds: Math.round((Date.now() - started) / 1000),
+        headlines, pages, stocks: tested, events: [...events.values()].reduce((a, l) => a + l.length, 0), split,
+        best: { filter: fk, exit: xk, filterName: FILTERS[fk].name, exitName: EXITS[xk].name },
+        inSample: best?.ins ?? summarize(trades[fk][xk].filter((t) => t.day < split)),
+        outSample: summarize(unseen),
+        verdict: verdict(summarize(unseen)),
+        grid,
+        filters: Object.fromEntries(Object.entries(FILTERS).map(([k, v]) => [k, v.name])),
+        exits: Object.fromEntries(Object.entries(EXITS).map(([k, v]) => [k, v.name])),
+        byCatalyst: Object.entries(byCatalyst).map(([k, list]) => ({ key: k, label: CATALYSTS[k]?.label ?? k, all: summarize(list), unseen: summarize(list.filter((t) => t.day >= split)) })).sort((a, b) => b.all.n - a.all.n),
+        recent: unseen.slice().sort((a, b) => b.day.localeCompare(a.day)).slice(0, 25).map(({ symbol, day, net, adj, reason, catalyst }) => ({ symbol, day, net, adj, reason, catalyst })),
+        samples: samples.sort((a, b) => b.day.localeCompare(a.day)).slice(0, 30).map(({ symbol, day, title, net, adj, at }) => ({ symbol, day, title, net, adj, at })),
+      };
+      this.state.newsLab = lab;
+      this.net.mark('News lab', true, `${headlines} headlines, ${lab.events} good-news events on ${tested} stocks`);
+      this.touch();
+      return lab;
+    } catch (error) {
+      this.net.mark('News lab', false, error.message);
+      return null;
+    } finally {
+      this.newsLabBusy = false;
+    }
+  },
+};
+
+module.exports = { mixin, FILTERS, entryOf };
 
 };
 
@@ -4725,7 +4907,7 @@ function headers(config) {
 const enabled = (config) => Boolean(config.alpaca.keyId && config.alpaca.secret);
 
 // Newest news since `start`, newest first.
-async function news(net, config, { start, end = null, pages = 3, symbols = null, limit = 50 } = {}) {
+async function news(net, config, { start, end = null, pages = 3, symbols = null, limit = 50, gap = 0 } = {}) {
   const items = [];
   let token = '';
   for (let page = 0; page < pages; page++) {
@@ -4748,6 +4930,7 @@ async function news(net, config, { start, end = null, pages = 3, symbols = null,
     }
     token = body?.next_page_token;
     if (!token) break;
+    if (gap) await new Promise((r) => setTimeout(r, gap));
   }
   return items;
 }
@@ -7277,6 +7460,26 @@ ${Object.entries(pl.entries).map(([ek, name]) => html`<tr><td class="small"><b>$
 <h4>By size of the gap</h4>${split(pl.byGap)}`;
 }
 
+function newsSection(nl) {
+  if (!nl) return html`<div class="empty">The news lab runs after the swing and penny labs (it reads two years of headlines, about 20 minutes).</div>`;
+  if (nl.skipped) return html`<div class="empty">${nl.skipped}</div>`;
+  const cell = (s) => (s?.n ? html`${sig(s.avgAdj)}<br><span class="dim small">${s.n} · ${p0(s.win)} win</span>` : html`<span class="dim">–</span>`);
+  return html`<article class="card ${nl.verdict?.key === 'proven' ? 'buy' : nl.verdict?.key === 'off' ? 'avoid' : ''}">
+<div class="kicker">Best on the first year</div><h3 style="margin:2px 0 6px">${nl.best.filterName} · ${nl.best.exitName}</h3>
+${pill(nl.verdict)}
+<p class="small muted" style="margin-top:8px">${nl.headlines.toLocaleString('en-US')} headlines on ${nl.stocks} US halal stocks read by the site's built-in rules; ${nl.events} pieces of good news (7/10+) traded. News before the open is bought at the open, during the session at the close, after the close at the next open. Worked out ${timeAgo(nl.at)}.</p>
+<div class="scroll"><table class="list">${statHead()}${statRows('First year (choosing)', nl.inSample)}${statRows('Second year (unseen)', nl.outSample)}</table></div>
+${extra(nl.outSample)}
+</article>
+<h3>Every filter and exit on the unseen year (vs market)</h3>
+<div class="scroll"><table class="list"><tr><th>News</th>${Object.values(nl.exits).map((x) => html`<th class="small">${x}</th>`)}</tr>
+${Object.entries(nl.filters).map(([fk, name]) => html`<tr><td class="small"><b>${name}</b></td>${Object.keys(nl.exits).map((xk) => html`<td>${cell(nl.grid[fk]?.[xk]?.outSample)}</td>`)}</tr>`)}</table></div>
+<h3>By kind of news (8/10+, both years, exit above)</h3>
+<div class="scroll"><table class="list">${statHead()}${nl.byCatalyst.map((b) => statRows(b.label, b.all))}</table></div>
+${nl.samples?.length ? html`<details><summary class="small">Latest news trades (site's plan)</summary><div class="scroll"><table class="list"><tr><th>Stock</th><th>Day</th><th>Headline</th><th>Result</th></tr>
+${nl.samples.slice(0, 15).map((t) => html`<tr><td><a href="/s/${encodeURIComponent(t.symbol)}"><b>${t.symbol}</b></a></td><td class="small">${t.day}</td><td class="small">${t.title}</td><td>${changeSpan(t.net)}</td></tr>`)}</table></div></details>` : ''}`;
+}
+
 function labPage({ engine }) {
   const { config } = engine;
   const lab = engine.state.lab;
@@ -7303,6 +7506,8 @@ ${lab ? html`<div class="bubbles">
 </div>
 <p class="small muted">Worked out ${timeAgo(lab.at)} (${Math.round(lab.seconds / 60)} min). Runs again every week after the US close. ${lab.insiderEvents ? '' : 'The insider and 13D history was not loaded yet, so those setups show no trades this week.'}</p>
 <p class="small">${proven.length ? html`Switched on: ${proven.map(([, r]) => html`<span class="chip g">${r.short}</span> `)} — these boost signals and show on <a href="/smart">Smart money</a>. Setups marked ✕ can still show as news, but never make a signal on their own.` : 'Nothing has proven itself on the unseen year yet, so no setup makes signals on its own — only news rated 8/10+ with all checks does.'}</p>
+<h2>News signals (the site's main strategy)</h2>
+${newsSection(engine.state.newsLab)}
 <h2>Swing setups (days to weeks)</h2>
 ${cards.map(([k, r]) => setupCard(k, r))}`
     : html`<div class="empty">The first run starts at the next quiet time (after the US close or at the weekend) and takes about 30 minutes for ${engine.state.universe.symbols.length} stocks. ${engine.labBusy ? 'It is running now.' : ''}</div>`}
